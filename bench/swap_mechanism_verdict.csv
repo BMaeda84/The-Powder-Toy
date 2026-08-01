@@ -1,0 +1,10 @@
+elemento,mispredicts,max_dist,em_30px
+OIL,4467,259.0,0
+
+mispredicts_com_troca,4467
+mispredicts_sem_troca,0
+trocas_totais,71501
+trocas_max_num_frame,51
+desloc_total_px,266593
+desloc_explicado_por_troca_px,862254
+fracao_explicada_por_troca,3.234

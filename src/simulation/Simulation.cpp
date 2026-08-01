@@ -28,6 +28,19 @@
 
 namespace
 {
+	// * Contadores cumulativos de TROCA de posicao (o bloco final de try_move, onde a
+	//   particula deslocada e reposicionada em parts[i].x/y). Sao cumulativos de proposito:
+	//   a classificacao compara com o valor guardado no frame anterior, e a diferenca da
+	//   quantas trocas aquela particula sofreu no frame. Hipotese a testar: um mesmo OIL
+	//   trocado varias vezes por vizinhos mais densos acumula deslocamento muito acima do
+	//   que qualquer passo unico explicaria.
+	std::vector<long long> swapCumCount;
+	std::vector<float> swapCumDist;
+	bool swapProbeEnabled = false;
+}
+
+namespace
+{
 	struct SimulationImpl : public Simulation
 	{
 		struct Neighbourhood
@@ -1540,6 +1553,14 @@ int Simulation::try_move(int i, int x, int y, int nx, int ny)
 
 		if (pmap[ny][nx] && ID(pmap[ny][nx]) == ri)
 			pmap[ny][nx] = 0;
+		if (swapProbeEnabled)
+		{
+			// * Distancia que ESTA troca impoe a particula deslocada. Chebyshev para casar
+			//   com a metrica do halo, que e um quadrado em volta da faixa.
+			auto swapDist = std::max(std::fabs(parts[i].x - parts[ri].x), std::fabs(parts[i].y - parts[ri].y));
+			swapCumCount[ri] += 1;
+			swapCumDist[ri] += swapDist;
+		}
 		parts[ri].x = parts[i].x;
 		parts[ri].y = parts[i].y;
 		int rx = int(parts[ri].x + 0.5f);
@@ -2499,6 +2520,16 @@ namespace
 	std::vector<long long> clsMispredictByType;
 	std::vector<float> clsMispredictMaxDist;
 	std::vector<long long> clsMispredictAt30;   // saltos na assinatura exata da busca lateral
+
+	// * Estado de troca no frame anterior, para isolar quanto do salto veio de troca.
+	std::vector<long long> clsPrevSwapCount;
+	std::vector<float> clsPrevSwapDist;
+	// * Agregados so dos mispredicts: quantas trocas sofreram e quanto do deslocamento
+	//   essas trocas explicam. Se as trocas responderem por quase todo o salto, o mecanismo
+	//   esta confirmado; se responderem por pouco, a causa e outra e continua em aberto.
+	long long mispredictSwapTotal = 0, mispredictNoSwap = 0, mispredictWithSwap = 0;
+	long long mispredictMaxSwaps = 0;
+	double mispredictDistSum = 0.0, mispredictSwapDistSum = 0.0;
 }
 
 void SimulationImpl::UpdateParticles(int start, int end)
@@ -2532,6 +2563,11 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		clsMispredictByType.assign(PT_NUM, 0);
 		clsMispredictMaxDist.assign(PT_NUM, 0.0f);
 		clsMispredictAt30.assign(PT_NUM, 0);
+		clsPrevSwapCount.assign(NPART, 0);
+		clsPrevSwapDist.assign(NPART, 0.0f);
+		swapCumCount.assign(NPART, 0);
+		swapCumDist.assign(NPART, 0.0f);
+		swapProbeEnabled = true;
 	}
 	// * Zera por frame: o que interessa e a composicao de um frame, nao o acumulado.
 	clsParallel = 0; clsSerialType = 0; clsSerialMove = 0; clsMispredict = 0;
@@ -2585,6 +2621,22 @@ void SimulationImpl::UpdateParticles(int start, int end)
 					{
 						clsMispredictAt30[t] += 1;
 					}
+					// * Trocas sofridas por esta particula desde a ultima classificacao, ou
+					//   seja, durante o frame que produziu este salto.
+					auto swaps = swapCumCount[i] - clsPrevSwapCount[i];
+					auto swapDist = swapCumDist[i] - clsPrevSwapDist[i];
+					mispredictSwapTotal += swaps;
+					mispredictMaxSwaps = std::max(mispredictMaxSwaps, swaps);
+					mispredictDistSum += moved;
+					mispredictSwapDistSum += swapDist;
+					if (swaps > 0)
+					{
+						mispredictWithSwap += 1;
+					}
+					else
+					{
+						mispredictNoSwap += 1;
+					}
 				}
 			}
 			// * Preditor conservador: velocidade corrente em Chebyshev, com folga de um frame
@@ -2621,6 +2673,8 @@ void SimulationImpl::UpdateParticles(int start, int end)
 			clsPrevY[i] = parts[i].y;
 			clsPrevType[i] = t;
 			clsPrevParallel[i] = (!serialByType && !serialByMove) ? 1 : 0;
+			clsPrevSwapCount[i] = swapCumCount[i];
+			clsPrevSwapDist[i] = swapCumDist[i];
 		}
 		debug_mostRecentlyUpdated = i;
 
@@ -4359,6 +4413,18 @@ void Simulation::AfterSim()
 								clsMispredictByType[type], clsMispredictMaxDist[type],
 								clsMispredictAt30[type]);
 						}
+					}
+					// * Veredito sobre o mecanismo de troca, na mesma linha de saida.
+					std::fprintf(hist, "\nmispredicts_com_troca,%lld\n", mispredictWithSwap);
+					std::fprintf(hist, "mispredicts_sem_troca,%lld\n", mispredictNoSwap);
+					std::fprintf(hist, "trocas_totais,%lld\n", mispredictSwapTotal);
+					std::fprintf(hist, "trocas_max_num_frame,%lld\n", mispredictMaxSwaps);
+					std::fprintf(hist, "desloc_total_px,%.0f\n", mispredictDistSum);
+					std::fprintf(hist, "desloc_explicado_por_troca_px,%.0f\n", mispredictSwapDistSum);
+					if (mispredictDistSum > 0.0)
+					{
+						std::fprintf(hist, "fracao_explicada_por_troca,%.3f\n",
+							mispredictSwapDistSum / mispredictDistSum);
 					}
 					std::fclose(hist);
 				}
