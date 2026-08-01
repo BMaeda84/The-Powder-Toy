@@ -57,7 +57,20 @@ double RNG::uniform01Double()
 
 RNG::RNG()
 {
-	s[0] = time(nullptr);
+	// * O padrao semeia pelo relogio, o que faz duas execucoes da mesma cena divergirem e
+	//   deixa qualquer regressao de fisica indetectavel: nao ha com o que comparar.
+	//   TPT_RNG_SEED fixa a semente para sessoes reprodutiveis (medicao, teste, checksum).
+	//   Resolvido uma unica vez; o valor vale para todo RNG construido depois, que e
+	//   exatamente o que uma sessao determinista precisa. Zero mantem o comportamento
+	//   original, entao jogo normal nao muda.
+	static const unsigned long long fixedSeed = []() -> unsigned long long {
+		if (auto *env = std::getenv("TPT_RNG_SEED"))
+		{
+			return std::strtoull(env, nullptr, 10);
+		}
+		return 0;
+	}();
+	s[0] = fixedSeed ? fixedSeed : (unsigned long long)time(nullptr);
 	s[1] = 614;
 }
 

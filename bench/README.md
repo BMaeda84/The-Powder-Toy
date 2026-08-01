@@ -82,6 +82,47 @@ são locais (≤ 6 px), líquidos parados cabem em 32 px, mas matéria comum adv
 por pressão cruza centenas de pixels num único frame. Excluir uma lista de
 elementos especiais não basta — qualquer líquido pode ser arremessado.
 
+## Determinismo (`TPT_RNG_SEED` + `TPT_CHECKSUM_CSV`)
+
+Estágio 0 do `DESIGN_MULTITHREAD.md`, e pré-requisito de qualquer trabalho de
+física neste fork: sem um valor comparável entre execuções não há como afirmar
+que uma mudança preservou comportamento.
+
+**O TPT não é reprodutível por padrão.** `RNG::RNG()` semeia com
+`time(nullptr)`, então duas execuções da mesma cena divergem. `TPT_RNG_SEED` fixa
+a semente; valor ausente ou zero mantém o comportamento original, e o jogo normal
+não muda.
+
+`TPT_CHECKSUM_CSV` grava, por frame, um FNV-1a de 64 bits sobre o estado:
+partículas vivas (índice, tipo, posição, velocidade, temperatura, `life`,
+`ctype`, `tmp`..`tmp4`, `flags`, `dcolour`) e os grids `pv`, `vx`, `vy`, `hv`.
+Slots mortos ficam de fora, porque guardam lixo da vida anterior e mediriam o
+alocador, não a física. O grid de ar entra porque realimenta o movimento no frame
+seguinte: uma divergência só nele apareceria depois, nas partículas.
+
+Floats entram pelos bits, não pelo valor — o objetivo é justamente pegar
+diferença de último bit vinda de reordenação de operações.
+
+### Resultado medido
+
+Cena de 24k partículas, 300 frames:
+
+| execuções | resultado |
+|---|---|
+| 3× com `TPT_RNG_SEED=12345` | os 300 frames idênticos, checksum final `7d0c66a214696a08` |
+| 2× sem semente | divergem **no frame 1** (`c90a13a0…` vs `6a7e6330…`) |
+
+Na divergência sem semente a população é a mesma nos dois lados no frame 1, o que
+localiza a causa no RNG e não em criação/destruição de matéria.
+
+O uso prático é esse: o arnês aponta o **primeiro** frame que diverge, em vez de
+só dizer que o resultado final ficou diferente.
+
+```powershell
+$env:TPT_RNG_SEED     = "12345"
+$env:TPT_CHECKSUM_CSV = "$d\checksum.csv"
+```
+
 ## Alcance de leitura (análise estática)
 
 O `pmap` é `int[YRES][XRES]` cru e os elementos o recebem como `int (*)[XRES]`

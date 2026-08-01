@@ -4034,8 +4034,89 @@ void Simulation::BeforeSim(bool willUpdate)
 	}
 }
 
+namespace
+{
+	// * Checksum determinista do estado da simulacao. Base de qualquer trabalho futuro em
+	//   fisica neste fork: sem um valor comparavel entre execucoes nao ha como afirmar que
+	//   uma mudanca preservou comportamento, so olhar a tela e torcer.
+	//
+	//   FNV-1a de 64 bits sobre os bytes crus. A escolha e por ser simples, sem dependencia
+	//   e bem definida; nao ha requisito criptografico aqui, so deteccao de divergencia.
+	//   Floats entram pelos bits, nao pelo valor, porque o objetivo e justamente pegar
+	//   diferenca de ultimo bit vinda de reordenacao de operacoes.
+	struct StateChecksum
+	{
+		uint64_t hash = UINT64_C(1469598103934665603);
+
+		void feedBytes(const void *data, size_t size)
+		{
+			auto *bytes = static_cast<const unsigned char *>(data);
+			for (size_t i = 0; i < size; i++)
+			{
+				hash ^= bytes[i];
+				hash *= UINT64_C(1099511628211);
+			}
+		}
+
+		template<class T>
+		void feed(const T &value)
+		{
+			feedBytes(&value, sizeof(value));
+		}
+	};
+
+	std::FILE *checksumFile = nullptr;
+	bool checksumChecked = false;
+	int checksumFrame = 0;
+}
+
 void Simulation::AfterSim()
 {
+	if (!checksumChecked)
+	{
+		checksumChecked = true;
+		if (auto *path = std::getenv("TPT_CHECKSUM_CSV"))
+		{
+			checksumFile = std::fopen(path, "w");
+			if (checksumFile)
+			{
+				std::fprintf(checksumFile, "frame,live,checksum\n");
+			}
+		}
+	}
+	if (checksumFile)
+	{
+		StateChecksum sum;
+		int live = 0;
+		for (auto i = 0; i < NPART; i++)
+		{
+			// * Slots mortos guardam lixo da vida anterior e entram na lista livre, entao
+			//   incluí-los mediria o alocador, nao o estado fisico. O indice entra no hash
+			//   junto do conteudo para que mover uma particula de slot seja detectado.
+			const auto &p = parts[i];
+			if (!p.type)
+			{
+				continue;
+			}
+			live += 1;
+			sum.feed(i);
+			sum.feed(p.type);   sum.feed(p.life); sum.feed(p.ctype);
+			sum.feed(p.x);      sum.feed(p.y);    sum.feed(p.vx);    sum.feed(p.vy);
+			sum.feed(p.temp);   sum.feed(p.flags);
+			sum.feed(p.tmp);    sum.feed(p.tmp2); sum.feed(p.tmp3);  sum.feed(p.tmp4);
+			sum.feed(p.dcolour);
+		}
+		// * O grid de ar faz parte do estado: pressao e velocidade realimentam o movimento
+		//   no frame seguinte, entao uma divergencia so nele apareceria depois nas particulas.
+		sum.feedBytes(pv, sizeof(pv));
+		sum.feedBytes(vx, sizeof(vx));
+		sum.feedBytes(vy, sizeof(vy));
+		sum.feedBytes(hv, sizeof(hv));
+		checksumFrame += 1;
+		std::fprintf(checksumFile, "%d,%d,%016llx\n", checksumFrame, live, (unsigned long long)sum.hash);
+		std::fflush(checksumFile);
+	}
+
 	debug_mostRecentlyUpdated = -1;
 
 	if (emp_trigger_count)
