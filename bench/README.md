@@ -238,12 +238,36 @@ de pixels têm velocidade prevista abaixo de 19 px/frame.
 
 ### Por que o despacho por deslocamento não funciona
 
-O deslocamento longo **não vem de velocidade**. Vem da busca lateral de líquidos,
-que *realoca* a partícula por varredura de posição livre em vez de integrar
-`x += v*dt`. Um líquido praticamente parado pode ser transportado dezenas ou
-centenas de pixels num frame. Nenhuma função da velocidade prevê isso, e a
-classificação teria de acontecer antes do update, quando o destino da busca ainda
-não existe.
+O deslocamento longo **não vem de velocidade**: as partículas que se deslocam
+centenas de pixels têm velocidade prevista abaixo de 19 px/frame, e incluir o
+termo de advecção do ar não mudou um único mispredict. A classificação teria de
+acontecer antes do update, quando o destino ainda não existe.
+
+### Quem causa (medido, `TPT_MISPREDICT_CSV`)
+
+| elemento | mispredicts | pior salto | na assinatura de 30 px |
+|---|---:|---:|---:|
+| OIL | 2.108 | 260 px | **0** |
+
+Um único elemento, e **zero** saltos na janela de 30 px.
+
+**Isto refuta a explicação anterior deste documento.** A hipótese registrada era
+que a busca lateral de líquidos (`rt = 30`) realocava a partícula. Se fosse ela,
+os saltos se concentrariam em 30 px e apareceriam também em WATR, que é
+`Falldown = 2` com `Advection` e `AirDrag` idênticos aos do OIL. Nenhuma das duas
+coisas acontece: nenhum salto em 30 px, e WATR não aparece.
+
+O mecanismo real está **em aberto**. O que distingue OIL de WATR na cena é o peso
+(20 contra 30) e a inflamabilidade. Uma hipótese plausível — e explicitamente
+**não verificada** — é troca de posição com líquido mais denso: quando o mais
+pesado se desloca para a célula do mais leve, os dois trocam, e o leve é
+transportado para a origem do outro. Isso explicaria por que o leve salta e o
+pesado não. Confirmar exige instrumentar o caminho de troca, não mais inferência.
+
+O que está estabelecido por medição, e basta para a decisão de projeto: o
+deslocamento por frame não é previsível a partir do estado disponível antes do
+update, então a regra de despacho por deslocamento não é implementável como
+desenhada.
 
 Isso invalida a regra de despacho por deslocamento proposta em
 `DESIGN_MULTITHREAD.md`. O que sobra:

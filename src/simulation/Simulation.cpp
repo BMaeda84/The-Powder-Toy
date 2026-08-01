@@ -2491,6 +2491,14 @@ namespace
 	std::vector<float> clsPrevX, clsPrevY;
 	std::vector<int> clsPrevType;
 	std::vector<char> clsPrevParallel;
+
+	// * Histograma acumulado de mispredicts por elemento, com o pior deslocamento visto.
+	//   Sem isto a causa dos saltos longos fica sendo inferencia; com isto vira medicao:
+	//   se forem liquidos e a maioria dos saltos cair em 30 px, a busca lateral (rt = 30)
+	//   esta confirmada como mecanismo.
+	std::vector<long long> clsMispredictByType;
+	std::vector<float> clsMispredictMaxDist;
+	std::vector<long long> clsMispredictAt30;   // saltos na assinatura exata da busca lateral
 }
 
 void SimulationImpl::UpdateParticles(int start, int end)
@@ -2521,6 +2529,9 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		clsPrevY.assign(NPART, 0.0f);
 		clsPrevType.assign(NPART, 0);
 		clsPrevParallel.assign(NPART, 0);
+		clsMispredictByType.assign(PT_NUM, 0);
+		clsMispredictMaxDist.assign(PT_NUM, 0.0f);
+		clsMispredictAt30.assign(PT_NUM, 0);
 	}
 	// * Zera por frame: o que interessa e a composicao de um frame, nao o acumulado.
 	clsParallel = 0; clsSerialType = 0; clsSerialMove = 0; clsMispredict = 0;
@@ -2566,6 +2577,14 @@ void SimulationImpl::UpdateParticles(int start, int end)
 				if (moved > DecompHalo && clsPrevParallel[i])
 				{
 					clsMispredict += 1;
+					// * Registra por elemento. A janela de 29,5 a 30,5 isola a assinatura da
+					//   busca lateral de liquidos, cujo limite e exatamente rt = 30.
+					clsMispredictByType[t] += 1;
+					clsMispredictMaxDist[t] = std::max(clsMispredictMaxDist[t], moved);
+					if (moved > 29.5f && moved < 30.5f)
+					{
+						clsMispredictAt30[t] += 1;
+					}
 				}
 			}
 			// * Preditor conservador: velocidade corrente em Chebyshev, com folga de um frame
@@ -4319,6 +4338,32 @@ void Simulation::AfterSim()
 			parts.localAllocCount, parts.rescueCount,
 			clsParallel, clsSerialType, clsSerialMove, clsMispredict);
 		std::fflush(checksumFile);
+
+		// * Histograma de mispredicts por elemento, reescrito periodicamente. Reescrever em
+		//   vez de acumular linhas mantem o arquivo pequeno e sempre com o total corrente,
+		//   sem depender de um gancho de saida limpo que o jogo nao oferece.
+		if (!clsMispredictByType.empty() && (checksumFrame % 100) == 0)
+		{
+			if (auto *path = std::getenv("TPT_MISPREDICT_CSV"))
+			{
+				if (auto *hist = std::fopen(path, "w"))
+				{
+					auto &sd = SimulationData::CRef();
+					std::fprintf(hist, "elemento,mispredicts,max_dist,em_30px\n");
+					for (auto type = 1; type < PT_NUM; type++)
+					{
+						if (clsMispredictByType[type])
+						{
+							std::fprintf(hist, "%s,%lld,%.1f,%lld\n",
+								sd.elements[type].Name.ToUtf8().c_str(),
+								clsMispredictByType[type], clsMispredictMaxDist[type],
+								clsMispredictAt30[type]);
+						}
+					}
+					std::fclose(hist);
+				}
+			}
+		}
 	}
 
 	debug_mostRecentlyUpdated = -1;
