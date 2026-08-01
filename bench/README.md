@@ -81,3 +81,48 @@ Conclusão: não existe halo fixo que torne a decomposição correta. Pós e só
 são locais (≤ 6 px), líquidos parados cabem em 32 px, mas matéria comum advectada
 por pressão cruza centenas de pixels num único frame. Excluir uma lista de
 elementos especiais não basta — qualquer líquido pode ser arremessado.
+
+## Alcance de leitura (análise estática)
+
+O `pmap` é `int[YRES][XRES]` cru e os elementos o recebem como `int (*)[XRES]`
+(ver `UPDATE_FUNC_SUBCALL_ARGS`), então não há como instrumentar as leituras com
+um wrapper sem mudar a assinatura de update de todos os elementos. Os números
+abaixo vêm de extração estática dos limites de laço, **não** de medição — a
+diferença importa e há risco de padrão não capturado.
+
+Varredura de vizinhança centrada, 99 dos 195 elementos:
+
+| raio | elementos |
+|---:|---:|
+| 1 px | 62 |
+| 2 px | 36 |
+| 4 px | 1 (STKM) |
+
+Ou seja: a esmagadora maioria lê no máximo um 5x5. Os limites longos são poucos e
+nomeáveis:
+
+- `DTEC`: raio de `tmp2`, **limitado a 25 px** pelo próprio código;
+- busca lateral de líquidos no `Simulation.cpp`: `rt = 30`, que é leitura tanto
+  quanto escrita;
+- `LDTC`: varre em 8 direções e o próprio comentário diz *"tmp is the number of
+  particles that will be scanned before scanning stops. Unbounded if 0"* — 0 é
+  valor válido, portanto **ilimitado**;
+- `ETRD`: procura a partícula sparkável mais próxima com
+  `maxDistance = hypot(XRES, YRES)`, isto é, **a diagonal da tela inteira**;
+- `ARAY`/`CRAY`/`DRAY`: caminhada direcional até encontrar bloqueio, limitada só
+  por `XRES`/`YRES`;
+- `WIFI`, `PRTI`/`PRTO`, `EMP`: sem localidade nenhuma por design.
+
+### A assimetria que define o desenho
+
+Leitura e escrita quebram a localidade por motivos diferentes, e isso muda o que
+é possível:
+
+- as leituras longas vêm de um conjunto **enumerável** de elementos-máquina
+  (`LDTC`, `ETRD`, raios, `WIFI`, portais, `EMP`), que são raros numa cena e
+  podem ser mandados para um passe serial por tipo;
+- as escritas longas vêm de **matéria comum** advectada por pressão (o óleo dos
+  280 px), e portanto não podem ser excluídas por tipo.
+
+Logo, qualquer decomposição precisa de duas regras diferentes: lista de exclusão
+por tipo para leitura, e despacho por deslocamento pretendido para escrita.
