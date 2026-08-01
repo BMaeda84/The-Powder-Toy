@@ -46,3 +46,38 @@ escala com a população. `Air::update_air` custa ~0,7 ms **independente** da
 quantidade de matéria, porque opera num grid de tamanho fixo — paralelizá-lo não
 muda nada perceptível. Com 143.636 partículas (61% da capacidade) o jogo cai para
 24 FPS, que é onde o custo passa a ser sentido.
+
+## Alcance de interação (`TPT_REACH_CSV`)
+
+Decomposição espacial do laço de partículas só é válida se o update de uma
+partícula tocar uma vizinhança limitada. A sonda mede o deslocamento real por
+frame (distância de Chebyshev, que é a métrica relevante porque um halo quadrado
+é o que uma decomposição teria de reservar) e registra qual elemento produziu o
+maior salto.
+
+Medido no cenário denso:
+
+| elemento | mediana do maior salto | pior salto |
+|---|---:|---:|
+| SAND / STNE (pós) | 3–4 px | 6 px |
+| WATR | 30 px | 31 px |
+| OIL | 68 px | **280 px** |
+
+Em 38% dos frames houve salto acima de 64 px, sempre de OIL.
+
+Limites vindos do código, não da medição:
+
+- busca lateral de líquidos: `rt = 30` (a assinatura aparece nos dados — 18% dos
+  frames têm salto máximo exatamente 30,00 px);
+- `MAX_VELOCITY = 1e4` px por frame, ~16x a largura da tela: o clamp de
+  velocidade **não** fornece limite espacial útil;
+- `water_equal_test = 0` por padrão, então `flood_water` não explica os saltos
+  longos observados; a causa é advecção pelo grid de ar (pressão do fogo);
+- alcance genuinamente global, sem qualquer localidade: `WIFI` (canais em
+  `wireless[]`), `PRTI`/`PRTO` (portais em `portalp[]`), `ARAY`/`CRAY`/`DRAY`
+  (raios limitados só por `XRES`/`YRES`) e `EMP` (gatilho global).
+
+Conclusão: não existe halo fixo que torne a decomposição correta. Pós e sólidos
+são locais (≤ 6 px), líquidos parados cabem em 32 px, mas matéria comum advectada
+por pressão cruza centenas de pixels num único frame. Excluir uma lista de
+elementos especiais não basta — qualquer líquido pode ser arremessado.

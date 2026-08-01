@@ -17,10 +17,14 @@
 #include "elements/FILT.h"
 #include "elements/PRTI.h"
 #include "elements/PLNT.h"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <numbers>
 #include <set>
 #include <stack>
+#include <vector>
 
 namespace
 {
@@ -2293,9 +2297,112 @@ SimulationImpl::Neighbourhood SimulationImpl::GetNeighbourhood(int i) const
 	return n;
 }
 
+namespace
+{
+	// * Reach probe. Splitting the particle loop across threads by region is only sound if a
+	//   single particle's update touches a bounded neighbourhood. This measures the real
+	//   per-frame displacement (the write side of that reach) instead of assuming a bound:
+	//   snapshot every live particle's position on entry, compare on exit, and bucket the
+	//   Chebyshev distance, which is the relevant metric because a square halo around a
+	//   region is what a decomposition would have to reserve. Inactive unless TPT_REACH_CSV
+	//   is set, so normal play pays nothing.
+	struct ReachProbe
+	{
+		static std::FILE *file;
+		static bool checked;
+		static int frameCounter;
+
+		const Particle *parts;
+		std::vector<float> beforeX, beforeY;
+		std::vector<int> beforeType;
+
+		explicit ReachProbe(const Particle *newParts) : parts(newParts)
+		{
+			if (!checked)
+			{
+				checked = true;
+				if (auto *path = std::getenv("TPT_REACH_CSV"))
+				{
+					file = std::fopen(path, "w");
+					if (file)
+					{
+						std::fprintf(file, "frame,moved,max_cheb,max_elem,gt1,gt2,gt4,gt8,gt16,gt32,gt64\n");
+					}
+				}
+			}
+			if (!file)
+			{
+				return;
+			}
+			beforeX.resize(NPART);
+			beforeY.resize(NPART);
+			beforeType.resize(NPART);
+			for (auto i = 0; i < NPART; i++)
+			{
+				beforeType[i] = parts[i].type;
+				beforeX[i] = parts[i].x;
+				beforeY[i] = parts[i].y;
+			}
+		}
+
+		~ReachProbe()
+		{
+			if (!file)
+			{
+				return;
+			}
+			frameCounter += 1;
+			int moved = 0;
+			float maxCheb = 0.f;
+			// * Which element produced the longest jump: a decomposition can only exclude the
+			//   long-reach cases from the parallel path if it knows which ones they are.
+			int maxType = 0;
+			int buckets[7] = {};
+			constexpr float thresholds[7] = { 1.f, 2.f, 4.f, 8.f, 16.f, 32.f, 64.f };
+			for (auto i = 0; i < NPART; i++)
+			{
+				// * Only particles that survived the frame as the same type are comparable;
+				//   a recycled slot would report the distance between two unrelated particles.
+				if (!beforeType[i] || parts[i].type != beforeType[i])
+				{
+					continue;
+				}
+				auto dx = std::fabs(parts[i].x - beforeX[i]);
+				auto dy = std::fabs(parts[i].y - beforeY[i]);
+				auto cheb = std::max(dx, dy);
+				if (cheb > 0.f)
+				{
+					moved += 1;
+				}
+				if (cheb > maxCheb)
+				{
+					maxCheb = cheb;
+					maxType = beforeType[i];
+				}
+				for (auto b = 0; b < 7; b++)
+				{
+					if (cheb > thresholds[b])
+					{
+						buckets[b] += 1;
+					}
+				}
+			}
+			auto &sd = SimulationData::CRef();
+			auto maxName = (maxType > 0 && maxType < PT_NUM) ? sd.elements[maxType].Name.ToUtf8() : ByteString("none");
+			std::fprintf(file, "%d,%d,%.2f,%s,%d,%d,%d,%d,%d,%d,%d\n", frameCounter, moved, maxCheb, maxName.c_str(),
+				buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5], buckets[6]);
+			std::fflush(file);
+		}
+	};
+	std::FILE *ReachProbe::file = nullptr;
+	bool ReachProbe::checked = false;
+	int ReachProbe::frameCounter = 0;
+}
+
 void SimulationImpl::UpdateParticles(int start, int end)
 {
 	FrameTime::Span span(frameTime, "Simulation::UpdateParticles");
+	ReachProbe reachProbe(parts.data.data());
 	//the main particle loop function, goes over all particles.
 	auto &sd = SimulationData::CRef();
 	auto &elements = sd.elements;
