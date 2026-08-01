@@ -2,6 +2,7 @@
 #include "common/String.h"
 #include <vector>
 #include <chrono>
+#include <cstdio>
 #include <map>
 #include <optional>
 
@@ -31,6 +32,17 @@ class FrameTime
 		double duration;
 	};
 	std::vector<AveragedSpan> lastAveragedSpans;
+
+	// * Optional CSV dump of the averaged spans, enabled by setting TPT_FRAMETIME_CSV to a
+	//   path. The spans are otherwise only readable from the on-screen debug HUD, which is
+	//   no use for batch measurement; profiling a change to the solver needs numbers that
+	//   can be diffed between builds. Off unless the variable is set, so normal play is
+	//   unaffected.
+	std::FILE *dumpFile = nullptr;
+	bool dumpChecked = false;
+	bool dumpHeaderWritten = false;
+	int dumpFrameCounter = 0;
+	void MaybeDump();
 
 	void BeginFrame();
 	void EndFrame();

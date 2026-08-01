@@ -2295,6 +2295,7 @@ SimulationImpl::Neighbourhood SimulationImpl::GetNeighbourhood(int i) const
 
 void SimulationImpl::UpdateParticles(int start, int end)
 {
+	FrameTime::Span span(frameTime, "Simulation::UpdateParticles");
 	//the main particle loop function, goes over all particles.
 	auto &sd = SimulationData::CRef();
 	auto &elements = sd.elements;
@@ -3735,9 +3736,15 @@ void Simulation::BeforeSim(bool willUpdate)
 		}
 
 		if(aheat_enable)
+		{
+			FrameTime::Span span(frameTime, "Air::update_airh");
 			air->update_airh();
+		}
 
-		DispatchNewtonianGravity();
+		{
+			FrameTime::Span span(frameTime, "Simulation::DispatchNewtonianGravity");
+			DispatchNewtonianGravity();
+		}
 		// gravIn::mass is now potentially garbage, which is ok, we were going to clear it for the frame anyway
 		for (auto p : gravIn.mass.Size().OriginRect())
 		{
@@ -3787,6 +3794,7 @@ void Simulation::BeforeSim(bool willUpdate)
 		// check for stacking and create BHOL if found
 		if (force_stacking_check || rng.chance(1, 10))
 		{
+			FrameTime::Span span(frameTime, "Simulation::CheckStacking");
 			CheckStacking();
 		}
 
@@ -3894,6 +3902,7 @@ void Simulation::BeforeSim(bool willUpdate)
 		// GSPEED is frames per generation
 		if (elementCount[PT_LIFE]>0 && ++CGOL>=GSPEED)
 		{
+			FrameTime::Span span(frameTime, "Simulation::SimulateGoL");
 			SimulateGoL();
 		}
 
