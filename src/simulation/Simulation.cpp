@@ -2457,6 +2457,40 @@ namespace
 	std::FILE *ReachProbe::file = nullptr;
 	bool ReachProbe::checked = false;
 	int ReachProbe::frameCounter = 0;
+
+	// ---- Classificacao para decomposicao espacial (estagio 3) -------------------------
+	// * Halo que uma faixa teria de reservar. 32 px cobre a busca lateral de liquidos
+	//   (rt = 30, medido) e as varreduras de vizinhanca dos elementos (raio 1 ou 2, com
+	//   STKM em 4 e DTEC limitado a 25 pelo proprio codigo).
+	constexpr float DecompHalo = 32.0f;
+
+	// * Elementos cuja LEITURA nao tem limite espacial: detectores que varrem em linha,
+	//   emissores de raio, canais de WIFI, portais e o gatilho global do EMP. Ao contrario
+	//   das escritas longas, que vem de materia comum advectada e portanto nao sao
+	//   excluiveis por tipo, estes sao enumeraveis e vao para um passe serial.
+	bool IsUnboundedReader(int type)
+	{
+		switch (type)
+		{
+		case PT_LDTC: case PT_ETRD: case PT_ARAY: case PT_CRAY: case PT_DRAY:
+		case PT_WIFI: case PT_PRTI: case PT_PRTO: case PT_EMP:
+		case PT_STKM: case PT_STKM2: case PT_FIGH:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	// * Contadores do frame corrente. serialType = leitura ilimitada; serialMove = escrita
+	//   longa prevista; mispredict = classificado como paralelo mas que ANDOU mais que o
+	//   halo, ou seja, falha de seguranca do preditor. Esse ultimo e o numero que decide se
+	//   a classificacao pode ser confiada.
+	long long clsParallel = 0, clsSerialType = 0, clsSerialMove = 0, clsMispredict = 0;
+	// * Posicao e tipo na classificacao anterior de cada slot, para medir o deslocamento
+	//   efetivo de um frame e confrontar com o que o preditor disse.
+	std::vector<float> clsPrevX, clsPrevY;
+	std::vector<int> clsPrevType;
+	std::vector<char> clsPrevParallel;
 }
 
 void SimulationImpl::UpdateParticles(int start, int end)
@@ -2476,6 +2510,20 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		auto *env = std::getenv("TPT_FREELIST_BANDING");
 		return env && std::atoi(env) != 0;
 	}();
+	// * Classificacao de decomposicao (estagio 3): so mede, nao muda ordem nem comportamento.
+	static const bool classifyEnabled = []() {
+		auto *env = std::getenv("TPT_CLASSIFY");
+		return env && std::atoi(env) != 0;
+	}();
+	if (classifyEnabled && clsPrevType.empty())
+	{
+		clsPrevX.assign(NPART, 0.0f);
+		clsPrevY.assign(NPART, 0.0f);
+		clsPrevType.assign(NPART, 0);
+		clsPrevParallel.assign(NPART, 0);
+	}
+	// * Zera por frame: o que interessa e a composicao de um frame, nao o acumulado.
+	clsParallel = 0; clsSerialType = 0; clsSerialMove = 0; clsMispredict = 0;
 	Defer resetSegment([this]() { parts.SetCurrentSegment(0); });
 	//the main particle loop function, goes over all particles.
 	auto &sd = SimulationData::CRef();
@@ -2504,6 +2552,56 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		{
 			auto band = int(parts[i].x) * parts.FreeSegments() / XRES;
 			parts.SetCurrentSegment(std::max(0, std::min(band, parts.FreeSegments() - 1)));
+		}
+		if (classifyEnabled)
+		{
+			// * Confere primeiro o palpite do frame anterior: quanto esta particula andou de
+			//   fato desde a ultima classificacao. Se tinha sido dada como paralela e andou
+			//   mais que o halo, o preditor falhou de um jeito que corromperia estado numa
+			//   execucao paralela de verdade. E este numero, e nao a fracao serial, que diz
+			//   se a classificacao pode ser confiada.
+			if (clsPrevType[i] == t)
+			{
+				auto moved = std::max(std::fabs(parts[i].x - clsPrevX[i]), std::fabs(parts[i].y - clsPrevY[i]));
+				if (moved > DecompHalo && clsPrevParallel[i])
+				{
+					clsMispredict += 1;
+				}
+			}
+			// * Preditor conservador: velocidade corrente em Chebyshev, com folga de um frame
+			//   de aceleracao, mais o raio de varredura do tipo. Usa a velocidade de entrada
+			//   porque a classificacao teria de acontecer antes do update numa execucao
+			//   paralela; e justamente por isso que ela pode errar, e por isso que o
+			//   contador acima existe.
+			// * O preditor anterior usava so a velocidade de entrada e errava feio: a
+			//   aceleracao que arremessa materia vem da ADVECCAO pelo grid de ar, aplicada
+			//   dentro do mesmo frame. Como o grid de ar e resolvido em BeforeSim, antes
+			//   deste laco, o termo e conhecido aqui e entra na previsao.
+			//   Limite: |v|*Loss + |Advection * v_ar| + margem de gravidade, em Chebyshev.
+			auto cx = std::max(0, std::min(int(parts[i].x + 0.5f), XRES - 1)) / CELL;
+			auto cy = std::max(0, std::min(int(parts[i].y + 0.5f), YRES - 1)) / CELL;
+			auto adv = std::fabs(sd.elements[t].Advection);
+			auto predVx = std::fabs(parts[i].vx) + adv * std::fabs(vx[cy][cx]);
+			auto predVy = std::fabs(parts[i].vy) + adv * std::fabs(vy[cy][cx]);
+			auto speed = std::max(predVx, predVy);
+			bool serialByType = IsUnboundedReader(t);
+			bool serialByMove = (speed * 1.5f + 4.0f) > DecompHalo;
+			if (serialByType)
+			{
+				clsSerialType += 1;
+			}
+			else if (serialByMove)
+			{
+				clsSerialMove += 1;
+			}
+			else
+			{
+				clsParallel += 1;
+			}
+			clsPrevX[i] = parts[i].x;
+			clsPrevY[i] = parts[i].y;
+			clsPrevType[i] = t;
+			clsPrevParallel[i] = (!serialByType && !serialByMove) ? 1 : 0;
 		}
 		debug_mostRecentlyUpdated = i;
 
@@ -4164,6 +4262,7 @@ namespace
 	std::FILE *checksumFile = nullptr;
 	bool checksumChecked = false;
 	int checksumFrame = 0;
+
 }
 
 void Simulation::AfterSim()
@@ -4176,7 +4275,7 @@ void Simulation::AfterSim()
 			checksumFile = std::fopen(path, "w");
 			if (checksumFile)
 			{
-				std::fprintf(checksumFile, "frame,live,checksum,freelist_ok,freelist_count,segments,local_alloc,rescue\n");
+				std::fprintf(checksumFile, "frame,live,checksum,freelist_ok,freelist_count,segments,local_alloc,rescue,cls_parallel,cls_serial_type,cls_serial_move,cls_mispredict\n");
 			}
 		}
 	}
@@ -4215,9 +4314,10 @@ void Simulation::AfterSim()
 		int freeCount = 0;
 		bool freeOk = parts.ValidateFreeLists(freeCount);
 		checksumFrame += 1;
-		std::fprintf(checksumFile, "%d,%d,%016llx,%d,%d,%d,%lld,%lld\n", checksumFrame, live,
+		std::fprintf(checksumFile, "%d,%d,%016llx,%d,%d,%d,%lld,%lld,%lld,%lld,%lld,%lld\n", checksumFrame, live,
 			(unsigned long long)sum.hash, freeOk ? 1 : 0, freeCount, parts.FreeSegments(),
-			parts.localAllocCount, parts.rescueCount);
+			parts.localAllocCount, parts.rescueCount,
+			clsParallel, clsSerialType, clsSerialMove, clsMispredict);
 		std::fflush(checksumFile);
 	}
 

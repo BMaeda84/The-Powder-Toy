@@ -213,6 +213,59 @@ segmentos nunca disparou, porque cada faixa sempre achou slot na própria lista.
 continua **sem teste**. Precisa de um cenário com faixas assimétricas — uma que
 só destrói e outra que só cria.
 
+## Classificação para decomposição (estágio 3) — RESULTADO NEGATIVO
+
+Estágio desenhado para matar ou aprovar o projeto barato, medindo que fração da
+matéria cairia num passe serial. `TPT_CLASSIFY=1` classifica cada partícula em
+paralela, serial-por-tipo (leitor ilimitado) ou serial-por-movimento (deslocamento
+previsto acima do halo de 32 px), e conta os **mispredicts**: partículas dadas
+como paralelas que depois andaram mais que o halo.
+
+A fração serial não é o número que decide. O que decide é o mispredict, porque
+**um único** basta para corromper estado numa execução paralela. O critério é
+zero, não "poucos".
+
+### Medido (cena densa, 143,6k partículas, 900 frames)
+
+| preditor | fração serial | mispredicts |
+|---|---:|---:|
+| velocidade de entrada | 0,00% | **2.108** em 444 frames |
+| velocidade + advecção do ar | 0,00% | **2.108** em 444 frames |
+
+Idênticos até o dígito. A advecção não explica nada, e a fração serial é zero
+porque `serialByMove` quase nunca dispara: as partículas que se deslocam centenas
+de pixels têm velocidade prevista abaixo de 19 px/frame.
+
+### Por que o despacho por deslocamento não funciona
+
+O deslocamento longo **não vem de velocidade**. Vem da busca lateral de líquidos,
+que *realoca* a partícula por varredura de posição livre em vez de integrar
+`x += v*dt`. Um líquido praticamente parado pode ser transportado dezenas ou
+centenas de pixels num frame. Nenhuma função da velocidade prevê isso, e a
+classificação teria de acontecer antes do update, quando o destino da busca ainda
+não existe.
+
+Isso invalida a regra de despacho por deslocamento proposta em
+`DESIGN_MULTITHREAD.md`. O que sobra:
+
+- **halo ≥ 280 px** (o pior salto medido): com `XRES = 612` cabem 2 faixas, o que
+  não é paralelismo;
+- **líquidos inteiros no passe serial**: em cena típica de TPT são fração grande
+  da matéria, e o teto de ganho cai junto;
+- **mudar o movimento de líquidos** para não teleportar: deixa de ser
+  paralelização e passa a ser mudança de física, com o comportamento de água e
+  óleo alterado de forma visível.
+
+Nenhuma dessas é o projeto que estava desenhado.
+
+### Ressalva sobre a evidência
+
+A atribuição à busca lateral é inferência forte, não medição direta: bate com o
+alcance medido (WATR exatamente em 30 px, a assinatura de `rt = 30`; pós no
+máximo 6 px; OIL até 280 px) e com o fracasso total do preditor de velocidade.
+A confirmação direta seria registrar o elemento e o caminho de código de cada
+mispredict — não foi feito.
+
 ## Alcance de leitura (análise estática)
 
 O `pmap` é `int[YRES][XRES]` cru e os elementos o recebem como `int (*)[XRES]`
