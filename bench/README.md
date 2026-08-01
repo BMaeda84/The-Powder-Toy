@@ -37,11 +37,15 @@ Medianas na janela estável, em milissegundos:
 |---|---:|---:|
 | Frame time | 16,70 | 41,14 |
 | GameModel::UpdateUpTo (simulação) | 7,12 | 27,91 |
-| Simulation::UpdateParticles | 5,68 | 25,76 |
+| Simulation::UpdateParticles | 5,68 | 25,90 |
 | Air::update_air | 0,70 | 0,66 |
 | Simulation::RecalcFreeParticles | 0,63 | 1,33 |
 
-Leitura: com carga real, `UpdateParticles` é 80–92% do trabalho de simulação e
+O valor denso de `UpdateParticles` foi corrigido de 25,76 para 25,90 ms: o CSV
+antigo tem spans condicionais e 88 das 780 linhas possuem uma coluna extra. A
+extração original por nome deslocava o campo nesses frames; ancorar
+`UpdateParticles` pela penúltima coluna preserva o valor correto. A conclusão
+não muda: com carga real, `UpdateParticles` é 80–92% do trabalho de simulação e
 escala com a população. `Air::update_air` custa ~0,7 ms **independente** da
 quantidade de matéria, porque opera num grid de tamanho fixo — paralelizá-lo não
 muda nada perceptível. Com 143.636 partículas (61% da capacidade) o jogo cai para
@@ -72,15 +76,17 @@ Limites vindos do código, não da medição:
 - `MAX_VELOCITY = 1e4` px por frame, ~16x a largura da tela: o clamp de
   velocidade **não** fornece limite espacial útil;
 - `water_equal_test = 0` por padrão, então `flood_water` não explica os saltos
-  longos observados; a causa é advecção pelo grid de ar (pressão do fogo);
+  longos observados; a causa confirmada depois é a troca repetida de posição
+  com partículas processadas mais tarde no mesmo frame;
 - alcance genuinamente global, sem qualquer localidade: `WIFI` (canais em
   `wireless[]`), `PRTI`/`PRTO` (portais em `portalp[]`), `ARAY`/`CRAY`/`DRAY`
   (raios limitados só por `XRES`/`YRES`) e `EMP` (gatilho global).
 
 Conclusão: não existe halo fixo que torne a decomposição correta. Pós e sólidos
-são locais (≤ 6 px), líquidos parados cabem em 32 px, mas matéria comum advectada
-por pressão cruza centenas de pixels num único frame. Excluir uma lista de
-elementos especiais não basta — qualquer líquido pode ser arremessado.
+são locais (≤ 6 px), líquidos parados cabem em 32 px, mas OIL leve foi
+reposicionado centenas de pixels por trocas sucessivas com líquidos mais densos.
+Esse destino depende das partículas processadas depois dele, logo não está
+disponível na classificação anterior ao update.
 
 ## Determinismo (`TPT_RNG_SEED` + `TPT_CHECKSUM_CSV`)
 
@@ -257,12 +263,17 @@ os saltos se concentrariam em 30 px e apareceriam também em WATR, que é
 `Falldown = 2` com `Advection` e `AirDrag` idênticos aos do OIL. Nenhuma das duas
 coisas acontece: nenhum salto em 30 px, e WATR não aparece.
 
-O mecanismo real está **em aberto**. O que distingue OIL de WATR na cena é o peso
-(20 contra 30) e a inflamabilidade. Uma hipótese plausível — e explicitamente
-**não verificada** — é troca de posição com líquido mais denso: quando o mais
-pesado se desloca para a célula do mais leve, os dois trocam, e o leve é
-transportado para a origem do outro. Isso explicaria por que o leve salta e o
-pesado não. Confirmar exige instrumentar o caminho de troca, não mais inferência.
+### Mecanismo confirmado por instrumentação direta
+
+A sonda seguinte instrumentou exatamente o bloco final de troca em `try_move`.
+Nessa execução, os **4.467 de 4.467** mispredicts de OIL haviam sido trocados de
+posição: 71.501 trocas no total, máximo de **51 trocas para a mesma partícula em
+um frame**. A soma das distâncias das trocas foi 3,234x o deslocamento líquido.
+
+Logo, o mecanismo é a troca repetida com partículas mais densas processadas
+depois do OIL no mesmo frame. O destino líquido não existe quando a classificação
+pré-update teria de decidir o passe, portanto não há preditor conservador baseado
+apenas no estado de entrada que implemente o desenho original.
 
 O que está estabelecido por medição, e basta para a decisão de projeto: o
 deslocamento por frame não é previsível a partir do estado disponível antes do
@@ -282,13 +293,186 @@ Isso invalida a regra de despacho por deslocamento proposta em
 
 Nenhuma dessas é o projeto que estava desenhado.
 
-### Ressalva sobre a evidência
+### Ressalva sobre a reprodutibilidade do contador
 
-A atribuição à busca lateral é inferência forte, não medição direta: bate com o
-alcance medido (WATR exatamente em 30 px, a assinatura de `rt = 30`; pós no
-máximo 6 px; OIL até 280 px) e com o fracasso total do preditor de velocidade.
-A confirmação direta seria registrar o elemento e o caminho de código de cada
-mispredict — não foi feito.
+O total de mispredicts passou de 2.108 para 4.467 entre execuções com a mesma
+semente e o mesmo preditor, embora a sonda nova só incremente contadores. A causa
+dessa divergência continua desconhecida. Ela impede comparar a taxa absoluta
+entre esses dois runs, mas não muda a atribuição do mecanismo dentro do run
+instrumentado: todos os 4.467 casos tinham troca registrada.
+
+## Quebra de custo de `UpdateParticles` (`TPT_UPDATE_COST_CSV`)
+
+Esta sonda mede os dois limites que restaram depois do resultado negativo do
+estágio 3, sem criar threads e sem alterar a ordem ou a física. É inativa por
+padrão e grava um CSV de schema fixo quando recebe um caminho. "Inativa" aqui
+significa sem relógio, alocação ou I/O: o binário ainda contém os desvios baratos
+da sonda, e não foi feita uma comparação contra um binário anterior à
+instrumentação.
+
+```powershell
+$env:TPT_UPDATE_COST_CSV = "$d\update-cost.csv"
+$env:TPT_UPDATE_COST_SAMPLE_STRIDE = "32" # padrão: 32
+```
+
+Durante esta medição, `TPT_REACH_CSV`, `TPT_CLASSIFY`, `TPT_CHECKSUM_CSV` e
+`TPT_MISPREDICT_CSV` ficaram desligados. Essas sondas fazem trabalho dentro ou
+ao redor do mesmo laço e contaminariam o custo.
+
+### O que exatamente é contado
+
+**Eixo A — classe de matéria.** A classe é congelada pelo tipo na entrada da
+iteração, que é o único estado disponível para um despacho real. A classificação
+usa a máscara oficial `Properties & STATE_FLAGS`, não `Falldown`:
+
+- candidato local: `TYPE_PART` mais `TYPE_SOLID`, excluindo os leitores sem
+  limite espacial já conhecidos;
+- fluido: `TYPE_LIQUID` mais `TYPE_GAS`;
+- resíduos explícitos: sólidos especiais, energia, atores, estado inesperado,
+  slots mortos e custo fixo fora do laço.
+
+O relógio só é lido quando a classe muda entre slots consecutivos. Assim todos
+os `continue` antecipados entram em alguma categoria, sem um span caro por
+partícula. `solid_special` fica separado porque somá-lo ao candidato inflaria o
+teto do caminho 2 com máquinas que já se sabe que precisam de passe serial.
+
+**Eixo B — movimento genérico contra restante.** O limite sintático é a única
+chamada a `MovementPhase`: ela contém `PlanMove`, todos os `do_move`/`try_move`,
+reflexão e as duas buscas laterais. O custo dessa chamada é amostrado de forma
+rotativa por índice e por frame. Os dois timestamps ficam diretamente ao redor
+da chamada no call site; retornos de helpers, branches e contadores da sonda
+ficam fora do intervalo. Cada duração observada é expandida pelo stride, e a
+janela cobre ciclos inteiros de todos os strides usados. O complemento é
+calculado por subtração e chama-se `update_remainder`.
+
+Esse nome é deliberado. O complemento **não é uma fase comprovadamente sem
+movimento nem segura para paralelizar**: `Element::Update` roda antes do corte,
+109 callbacks de elementos chamam criação, morte ou mudança de tipo, e `WARP`
+troca posições e escreve `pmap` diretamente. A condução de calor também escreve
+a temperatura de vizinhos. Portanto o eixo B é um teto temporal; a fração
+realmente independente só pode ser menor.
+
+O writer roda em `AfterSim`, fora do intervalo de `UpdateParticles`. O CSV inclui
+contagens de classe e de caminho, amostras cruas, `class_coverage_error_ns` e os
+resíduos necessários para refazer a conta.
+
+### Método
+
+- build `debugoptimized`, MSVC, `-j 3`;
+- cena densa, semente 12345, 900 frames, população estável de 143.636;
+- janela 640–895, 256 frames por execução; 256 é múltiplo de 16, 32 e 64, então
+  todas as fases da amostragem rotativa aparecem o mesmo número de vezes;
+- 3 pares intercalados, estritamente sequenciais, controle com sonda desligada e
+  medição com sonda ligada;
+- stride 32 nos três runs principais; runs adicionais com 16 e 64 para testar
+  convergência da amostragem;
+- percentuais calculados pela razão das somas na janela, não por média de médias.
+
+No MSVC desta máquina, `steady_clock` usa QPC e os pares vazios deram mínimo e
+p50 de 0 ns por quantização — por isso esses dois valores não corrigem nada. A
+sonda mede 64 lotes de 2.048 pares consecutivos e usa a mediana das médias dos
+lotes, resistente a preempções ocasionais. O baseline ficou entre 19,775 e
+19,971 ns nos três runs. A correção subtrai do agregado cru de movimento
+`baseline × amostras` antes de multiplicar pelo stride. O CSV preserva tanto a
+estimativa crua quanto a calibrada e os agregados crus por classe.
+
+O controle atual mediu `UpdateParticles` em **26,234 ms** (26,178–27,392 ms;
+dispersão 1,213 ms ou 4,63%) e a simulação em 27,987 ms. A sonda acrescentou
+6,86% na mediana dos pares (5,46–7,16%). Por isso os milissegundos abaixo usam o
+total do controle e as frações da sonda, em vez de chamar o custo do observador
+de trabalho físico. Uma tentativa intermediária abriu processos concorrentes;
+ela foi integralmente descartada e os dados publicados vêm apenas dos runs
+sequenciais. Os dados e contadores por run estão em
+`update_cost_dense_summary.csv`.
+
+### Eixo A — pós/sólidos contra líquidos/gases
+
+| run | pós + sólidos locais | líquidos + gases | outros + não atribuído |
+|---|---:|---:|---:|
+| 1 | 39,9214% | 60,0663% | 0,0123% |
+| 2 | 39,9751% | 60,0145% | 0,0104% |
+| 3 | 40,3305% | 59,6599% | 0,0096% |
+| **mediana** | **39,9751%** | **60,0145%** | **0,0104%** |
+| dispersão (máx − mín) | 0,4091 p.p. (1,02%) | 0,4064 p.p. (0,68%) | 0,0027 p.p. |
+
+Normalizado aos 26,234 ms do controle: **10,487 ms** ficam no candidato
+pós/sólidos, **15,744 ms** em líquidos/gases e 0,003 ms no restante.
+
+Na janela estável a cena contém 75.096 partículas `TYPE_PART` e 68.540
+`TYPE_LIQUID`. Não há `TYPE_SOLID`, gás vivo ou leitor especial nessa cena —
+`STNE` é classificado pelo TPT como pó. Portanto os 40,0% são um teto para esta
+carga específica, não uma alegação sobre saves dominados por máquinas sólidas.
+
+### Eixo B — `MovementPhase` contra restante do update
+
+| run | movimento cru | movimento calibrado | `update_remainder` calibrado |
+|---|---:|---:|---:|
+| 1 | 54,1837% | 44,0322% | 55,9678% |
+| 2 | 54,3620% | 43,9938% | 56,0062% |
+| 3 | 53,6066% | 43,7979% | 56,2021% |
+| **mediana** | **54,1837%** | **43,9938%** | **56,0062%** |
+| dispersão (máx − mín) | 0,7554 p.p. | 0,2343 p.p. (0,53%) | 0,2343 p.p. (0,42%) |
+
+A coluna crua demonstra por que calibrar o intervalo curto é obrigatório: ela
+superestima movimento em cerca de 10 p.p. Normalizado ao controle, **11,541 ms**
+estão no movimento genérico calibrado e **14,693 ms** no restante, usando
+alocação proporcional do overhead. Nos extremos — todo overhead fora ou dentro
+do candidato — a fração física de `update_remainder` fica entre 52,81% e 60,06%.
+
+Os runs de convergência deram 44,7660% de movimento com stride 16 e 44,6512%
+com stride 64. Eles ficam 0,62–0,97 p.p. acima do intervalo principal, portanto
+são concordância aproximada, não sobreposição. A dispersão total entre os cinco
+runs é 0,9681 p.p. (2,20% do movimento) e não muda a decisão.
+
+### Prova de cobertura e de exercício
+
+- `class_coverage_error_ns = 0` em todos os 768 frames da janela dos três runs;
+- soma dos buckets de classe + `fixed_ns` = `update_ns`; o resíduo mediano do
+  eixo A é só 0,0104%;
+- população = 143.636 nos checkpoints 200–900 de todos os seis runs principais
+  e dos dois runs de convergência;
+- por frame estável: 143.636 chamadas de `MovementPhase`, pelo menos 327.997
+  chamadas de `do_move` e de `try_move`, 684.138 passos de busca lateral e
+  45.892 callbacks de elemento;
+- a busca lateral vertical foi exercitada; a variante de gravidade arbitrária
+  ficou em zero porque o cenário usa gravidade vertical — lacuna registrada;
+- nenhum slot mudou de classe entre a entrada e `MovementPhase` nessa cena;
+- controle e sonda produziram os mesmos 300 checksums em uma validação separada,
+  com hash final `fc72af49e35cd27e` e população 143.636.
+
+### Tetos e decisão
+
+Aplicando Amdahl aos percentuais medidos:
+
+| caminho | fração candidata | 8 threads, `UpdateParticles` | threads infinitas, `UpdateParticles` | 8 threads, simulação | threads infinitas, simulação |
+|---|---:|---:|---:|---:|---:|
+| (2) só pós/sólidos locais | 39,98% | 1,54x | **1,67x** | 1,49x | **1,60x** |
+| (3) só `update_remainder` | 56,01% | 1,96x | **2,27x** | 1,85x | **2,11x** |
+
+Como limite conservador, todo o overhead observado também foi cobrado do bucket
+candidato e o maior resultado entre os runs foi normalizado ao controle. O
+caminho 2 chega só a 43,10% (1,76x infinito em `UpdateParticles`). O caminho 3
+pode chegar a 60,06%; mesmo esse cenário generoso dá 2,11x em oito threads para
+`UpdateParticles`, mas apenas **1,97x na simulação inteira**.
+
+Portanto o caminho 2 está descartado pelo teto. O caminho 3 **não** está
+descartado pelo teto infinito, mas falha o alvo de 2x com oito threads e seu
+bucket não é a fase segura descrita na hipótese: parte dele escreve `pmap`, cria,
+mata ou move partículas e teria de permanecer serial depois de uma auditoria
+real dos callbacks. Com a fração central, seriam necessárias 22 threads
+ideais só para cruzar 2x na simulação; sincronização e a redução do bucket seguro
+ainda diminuiriam isso. Basta a auditoria retirar 2,7 p.p. do update — menos de
+5% do bucket — para até o teto infinito da simulação voltar a ficar abaixo de
+2x.
+
+Recomendação: se o objetivo de pelo menos 2x em oito threads continuar, seguir
+com **(1) detecção de conflito com rollback** é o único caminho não limitado por
+esta quebra de custo. Isso não o aprova: o custo de detectar, registrar e repetir
+conflitos ainda precisa ser medido, e as trocas repetidas de OIL mostram que o
+pior caso é real. O caminho 3 merece no máximo uma auditoria de segurança antes
+de qualquer thread, caso se aceite um alvo menor ou muito mais paralelismo. Se a
+complexidade de rollback não for aceitável para o mod, parar aqui continua sendo
+a decisão fundamentada.
 
 ## Alcance de leitura (análise estática)
 

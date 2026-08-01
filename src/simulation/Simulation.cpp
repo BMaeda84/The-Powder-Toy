@@ -17,6 +17,7 @@
 #include "elements/FILT.h"
 #include "elements/PRTI.h"
 #include "elements/PLNT.h"
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,132 @@
 
 namespace
 {
+	using ParticleCostClock = std::chrono::steady_clock;
+
+	enum class ParticleCostClass : size_t
+	{
+		LoopDead,
+		Powder,
+		SolidLocal,
+		SolidSpecial,
+		Liquid,
+		Gas,
+		Energy,
+		ActorSpecial,
+		StateOther,
+		Count,
+	};
+
+	constexpr auto ParticleCostClassCount = size_t(ParticleCostClass::Count);
+	constexpr std::array<const char *, ParticleCostClassCount> particleCostClassNames = {
+		"loop_dead", "powder", "solid_local", "solid_special", "liquid",
+		"gas", "energy", "actor_special", "state_other",
+	};
+
+	struct ParticleCostFrame
+	{
+		uint64_t updateCalls = 0;
+		uint64_t updateNs = 0;
+		uint64_t loopNs = 0;
+		uint64_t slotsSeen = 0;
+		uint64_t liveSeen = 0;
+		uint64_t deadSlots = 0;
+		uint64_t classSwitches = 0;
+		uint64_t tryMoveCalls = 0;
+		uint64_t doMoveCalls = 0;
+		uint64_t lateralVerticalEntries = 0;
+		uint64_t lateralGravityEntries = 0;
+		uint64_t lateralSearchSteps = 0;
+		uint64_t elementUpdateCalls = 0;
+		uint64_t entryMovementClassChanges = 0;
+		uint64_t candidateToFluidChanges = 0;
+		std::array<uint64_t, ParticleCostClassCount> classCount = {};
+		std::array<uint64_t, ParticleCostClassCount> classNs = {};
+		std::array<uint64_t, ParticleCostClassCount> movementCalls = {};
+		std::array<uint64_t, ParticleCostClassCount> sampledMovementCalls = {};
+		std::array<uint64_t, ParticleCostClassCount> sampledMovementRawNs = {};
+
+		void Add(const ParticleCostFrame &other)
+		{
+			updateCalls += other.updateCalls;
+			updateNs += other.updateNs;
+			loopNs += other.loopNs;
+			slotsSeen += other.slotsSeen;
+			liveSeen += other.liveSeen;
+			deadSlots += other.deadSlots;
+			classSwitches += other.classSwitches;
+			tryMoveCalls += other.tryMoveCalls;
+			doMoveCalls += other.doMoveCalls;
+			lateralVerticalEntries += other.lateralVerticalEntries;
+			lateralGravityEntries += other.lateralGravityEntries;
+			lateralSearchSteps += other.lateralSearchSteps;
+			elementUpdateCalls += other.elementUpdateCalls;
+			entryMovementClassChanges += other.entryMovementClassChanges;
+			candidateToFluidChanges += other.candidateToFluidChanges;
+			for (size_t i = 0; i < ParticleCostClassCount; ++i)
+			{
+				classCount[i] += other.classCount[i];
+				classNs[i] += other.classNs[i];
+				movementCalls[i] += other.movementCalls[i];
+				sampledMovementCalls[i] += other.sampledMovementCalls[i];
+				sampledMovementRawNs[i] += other.sampledMovementRawNs[i];
+			}
+		}
+	};
+
+	std::FILE *particleCostFile = nullptr;
+	struct ParticleCostFileLifetime
+	{
+		~ParticleCostFileLifetime()
+		{
+			if (particleCostFile)
+			{
+				std::fclose(particleCostFile);
+				particleCostFile = nullptr;
+			}
+		}
+	};
+	ParticleCostFileLifetime particleCostFileLifetime;
+	bool particleCostChecked = false;
+	int particleCostFrameCounter = 0;
+	int particleCostSampleStride = 32;
+	uint64_t particleCostClockMinNs = 0;
+	uint64_t particleCostClockP50Ns = 0;
+	double particleCostClockBatchMeanMedianNs = 0.0;
+	constexpr int ParticleCostClockCalibrationBatches = 64;
+	constexpr int ParticleCostClockCalibrationSamplesPerBatch = 2048;
+	ParticleCostFrame particleCostWorking;
+	ParticleCostFrame particleCostPending;
+	bool particleCostPendingReady = false;
+	bool particleCostCollecting = false;
+	Simulation *particleCostOwner = nullptr;
+
+	void ClearParticleCostState()
+	{
+		particleCostWorking = {};
+		particleCostPending = {};
+		particleCostPendingReady = false;
+		particleCostCollecting = false;
+	}
+
+	void ReleaseParticleCostOwner(const Simulation *owner)
+	{
+		if (particleCostOwner == owner)
+		{
+			ClearParticleCostState();
+			particleCostOwner = nullptr;
+		}
+	}
+
+	void AcquireParticleCostOwner(Simulation *owner)
+	{
+		if (particleCostOwner != owner)
+		{
+			ClearParticleCostState();
+			particleCostOwner = owner;
+		}
+	}
+
 	// * Contadores cumulativos de TROCA de posicao (o bloco final de try_move, onde a
 	//   particula deslocada e reposicionada em parts[i].x/y). Sao cumulativos de proposito:
 	//   a classificacao compara com o valor guardado no frame anterior, e a diferenca da
@@ -1075,6 +1202,9 @@ bool Parts::ValidateFreeLists(int &freeCount) const
 
 void Simulation::clear_sim(void)
 {
+	// A debug partial update may not reach AfterSim. Do not carry its probe sample into a
+	// newly loaded or cleared simulation.
+	ReleaseParticleCostOwner(this);
 	for (auto i = 0; i < parts.active; i++)
 	{
 		if (parts[i].type)
@@ -1252,6 +1382,10 @@ int Simulation::eval_move(int pt, int nx, int ny, unsigned *rr) const
 
 int Simulation::try_move(int i, int x, int y, int nx, int ny)
 {
+	if (particleCostCollecting)
+	{
+		particleCostWorking.tryMoveCalls += 1;
+	}
 	unsigned r = 0, e;
 
 	if (x==nx && y==ny)
@@ -1573,6 +1707,10 @@ int Simulation::try_move(int i, int x, int y, int nx, int ny)
 // try to move particle, and if successful update pmap and parts[i].x,y
 int Simulation::do_move(int i, int x, int y, float nxf, float nyf)
 {
+	if (particleCostCollecting)
+	{
+		particleCostWorking.doMoveCalls += 1;
+	}
 	int nx = (int)(nxf+0.5f), ny = (int)(nyf+0.5f), result;
 	if (edgeMode == EDGE_LOOP)
 	{
@@ -2502,6 +2640,345 @@ namespace
 		}
 	}
 
+	uint64_t ParticleCostNs(ParticleCostClock::duration duration)
+	{
+		return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+	}
+
+	ParticleCostClass ClassifyParticleCost(int type, const std::array<Element, PT_NUM> &elements)
+	{
+		if (!type)
+		{
+			return ParticleCostClass::LoopDead;
+		}
+		auto state = elements[type].Properties & STATE_FLAGS;
+		if (IsUnboundedReader(type))
+		{
+			return state == TYPE_SOLID ? ParticleCostClass::SolidSpecial : ParticleCostClass::ActorSpecial;
+		}
+		switch (state)
+		{
+		case TYPE_PART:   return ParticleCostClass::Powder;
+		case TYPE_SOLID:  return ParticleCostClass::SolidLocal;
+		case TYPE_LIQUID: return ParticleCostClass::Liquid;
+		case TYPE_GAS:    return ParticleCostClass::Gas;
+		case TYPE_ENERGY: return ParticleCostClass::Energy;
+		default:          return ParticleCostClass::StateOther;
+		}
+	}
+
+	bool IsParticleCostCandidate(ParticleCostClass value)
+	{
+		return value == ParticleCostClass::Powder || value == ParticleCostClass::SolidLocal;
+	}
+
+	bool IsParticleCostFluid(ParticleCostClass value)
+	{
+		return value == ParticleCostClass::Liquid || value == ParticleCostClass::Gas;
+	}
+
+	void CalibrateParticleCostClock()
+	{
+		std::vector<uint64_t> samples;
+		samples.reserve(ParticleCostClockCalibrationBatches * ParticleCostClockCalibrationSamplesPerBatch);
+		std::array<double, ParticleCostClockCalibrationBatches> batchMeans = {};
+		for (auto batch = 0; batch < ParticleCostClockCalibrationBatches; ++batch)
+		{
+			long double batchTotal = 0.0L;
+			for (auto i = 0; i < ParticleCostClockCalibrationSamplesPerBatch; ++i)
+			{
+				auto begin = ParticleCostClock::now();
+				auto end = ParticleCostClock::now();
+				auto elapsed = ParticleCostNs(end - begin);
+				samples.push_back(elapsed);
+				batchTotal += elapsed;
+			}
+			batchMeans[batch] = double(batchTotal / ParticleCostClockCalibrationSamplesPerBatch);
+		}
+		std::sort(samples.begin(), samples.end());
+		std::sort(batchMeans.begin(), batchMeans.end());
+		particleCostClockMinNs = samples.front();
+		particleCostClockP50Ns = samples[samples.size() / 2];
+		particleCostClockBatchMeanMedianNs =
+			(batchMeans[ParticleCostClockCalibrationBatches / 2 - 1] +
+			 batchMeans[ParticleCostClockCalibrationBatches / 2]) / 2.0;
+	}
+
+	void EnsureParticleCostFile()
+	{
+		if (particleCostChecked)
+		{
+			return;
+		}
+		particleCostChecked = true;
+		if (auto *stride = std::getenv("TPT_UPDATE_COST_SAMPLE_STRIDE"))
+		{
+			particleCostSampleStride = std::clamp(std::atoi(stride), 1, NPART);
+		}
+		if (auto *path = std::getenv("TPT_UPDATE_COST_CSV"))
+		{
+			particleCostFile = std::fopen(path, "w");
+		}
+		if (!particleCostFile)
+		{
+			return;
+		}
+		CalibrateParticleCostClock();
+		std::fprintf(particleCostFile,
+			"frame,update_calls,update_ns,loop_ns,class_sum_ns,fixed_ns,class_coverage_error_ns,"
+			"update_remainder_raw_ns,move_est_raw_ns,update_remainder_min_corrected_ns,move_est_min_corrected_ns,"
+			"update_remainder_p50_corrected_ns,move_est_p50_corrected_ns,"
+			"update_remainder_calibrated_ns,move_est_calibrated_ns,"
+			"sample_stride,clock_min_ns,clock_p50_ns,clock_batch_mean_median_ns,"
+			"clock_calibration_batches,clock_calibration_samples_per_batch,"
+			"slots_seen,live_seen,dead_slots,class_switches,movement_calls,sampled_movement_calls,try_move_calls,"
+			"do_move_calls,lateral_vertical_entries,lateral_gravity_entries,lateral_search_steps,element_update_calls,"
+			"entry_movement_class_changes,candidate_to_fluid_changes");
+		for (auto *name : particleCostClassNames)
+		{
+			std::fprintf(particleCostFile, ",%s_count,%s_ns,%s_move_calls,%s_move_samples,%s_move_sample_raw_ns",
+				name, name, name, name, name);
+		}
+		std::fprintf(particleCostFile, "\n");
+	}
+
+	uint64_t EstimateParticleMovementNs(const ParticleCostFrame &frame, double intervalOverheadNs)
+	{
+		uint64_t samples = 0;
+		uint64_t rawNs = 0;
+		for (size_t i = 0; i < ParticleCostClassCount; ++i)
+		{
+			samples += frame.sampledMovementCalls[i];
+			rawNs += frame.sampledMovementRawNs[i];
+		}
+		auto overhead = static_cast<long double>(intervalOverheadNs) * samples;
+		auto adjusted = std::max(0.0L, static_cast<long double>(rawNs) - overhead);
+		// The rotating modulo sample gives every particle index probability 1 / stride
+		// over a complete cycle. Expanding each observation by stride keeps rare classes
+		// represented when a particular frame has calls but no sample in that class.
+		auto estimate = adjusted * particleCostSampleStride;
+		return uint64_t(estimate + 0.5L);
+	}
+
+	class ParticleCostProbe
+	{
+		Simulation *owner = nullptr;
+		bool enabled = false;
+		bool loopActive = false;
+		ParticleCostClass currentClass = ParticleCostClass::LoopDead;
+		ParticleCostClass entryClass = ParticleCostClass::LoopDead;
+		ParticleCostClock::time_point updateStartedAt;
+		ParticleCostClock::time_point loopStartedAt;
+		ParticleCostClock::time_point classStartedAt;
+
+	public:
+		explicit ParticleCostProbe(Simulation *newOwner):
+			owner(newOwner)
+		{
+			EnsureParticleCostFile();
+			enabled = particleCostFile != nullptr;
+			if (enabled)
+			{
+				AcquireParticleCostOwner(owner);
+				particleCostWorking = {};
+				particleCostWorking.updateCalls = 1;
+				updateStartedAt = ParticleCostClock::now();
+			}
+		}
+
+		~ParticleCostProbe()
+		{
+			if (!enabled || particleCostOwner != owner)
+			{
+				return;
+			}
+			if (loopActive)
+			{
+				EndLoop();
+			}
+			particleCostWorking.updateNs += ParticleCostNs(ParticleCostClock::now() - updateStartedAt);
+			particleCostPending.Add(particleCostWorking);
+			particleCostPendingReady = true;
+		}
+
+		void BeginLoop()
+		{
+			if (!enabled)
+			{
+				return;
+			}
+			loopActive = true;
+			currentClass = ParticleCostClass::LoopDead;
+			entryClass = currentClass;
+			loopStartedAt = classStartedAt = ParticleCostClock::now();
+			particleCostCollecting = true;
+		}
+
+		void EnterSlot(int type, const std::array<Element, PT_NUM> &elements)
+		{
+			if (!enabled)
+			{
+				return;
+			}
+			particleCostWorking.slotsSeen += 1;
+			entryClass = ClassifyParticleCost(type, elements);
+			auto index = size_t(entryClass);
+			particleCostWorking.classCount[index] += 1;
+			if (type)
+			{
+				particleCostWorking.liveSeen += 1;
+			}
+			else
+			{
+				particleCostWorking.deadSlots += 1;
+			}
+			if (entryClass != currentClass)
+			{
+				auto now = ParticleCostClock::now();
+				particleCostWorking.classNs[size_t(currentClass)] += ParticleCostNs(now - classStartedAt);
+				classStartedAt = now;
+				currentClass = entryClass;
+				particleCostWorking.classSwitches += 1;
+			}
+		}
+
+		void EndLoop()
+		{
+			if (!enabled || !loopActive)
+			{
+				return;
+			}
+			auto now = ParticleCostClock::now();
+			particleCostWorking.classNs[size_t(currentClass)] += ParticleCostNs(now - classStartedAt);
+			particleCostWorking.loopNs += ParticleCostNs(now - loopStartedAt);
+			particleCostCollecting = false;
+			loopActive = false;
+		}
+
+		void RecordElementUpdate()
+		{
+			if (enabled)
+			{
+				particleCostWorking.elementUpdateCalls += 1;
+			}
+		}
+
+		bool ShouldSampleMovement(int particleIndex, int movementType, const std::array<Element, PT_NUM> &elements)
+		{
+			if (!enabled)
+			{
+				return false;
+			}
+			auto entryIndex = size_t(entryClass);
+			particleCostWorking.movementCalls[entryIndex] += 1;
+			auto movementClass = ClassifyParticleCost(movementType, elements);
+			if (movementClass != entryClass)
+			{
+				particleCostWorking.entryMovementClassChanges += 1;
+				if (IsParticleCostCandidate(entryClass) && IsParticleCostFluid(movementClass))
+				{
+					particleCostWorking.candidateToFluidChanges += 1;
+				}
+			}
+			auto sample = (uint64_t(particleIndex) + uint64_t(particleCostFrameCounter + 1)) %
+				uint64_t(particleCostSampleStride) == 0;
+			if (sample)
+			{
+				particleCostWorking.sampledMovementCalls[entryIndex] += 1;
+			}
+			return sample;
+		}
+
+		void RecordMovement(ParticleCostClock::duration duration)
+		{
+			if (enabled)
+			{
+				particleCostWorking.sampledMovementRawNs[size_t(entryClass)] +=
+					ParticleCostNs(duration);
+			}
+		}
+	};
+
+	void DumpParticleCostFrame(const Simulation *owner)
+	{
+		if (!particleCostFile || particleCostOwner != owner || !particleCostPendingReady)
+		{
+			return;
+		}
+		auto &frame = particleCostPending;
+		uint64_t classSumNs = 0;
+		uint64_t movementCalls = 0;
+		uint64_t sampledMovementCalls = 0;
+		for (size_t i = 0; i < ParticleCostClassCount; ++i)
+		{
+			classSumNs += frame.classNs[i];
+			movementCalls += frame.movementCalls[i];
+			sampledMovementCalls += frame.sampledMovementCalls[i];
+		}
+		auto moveRawNs = EstimateParticleMovementNs(frame, 0.0);
+		auto moveMinNs = EstimateParticleMovementNs(frame, static_cast<double>(particleCostClockMinNs));
+		auto moveP50Ns = EstimateParticleMovementNs(frame, static_cast<double>(particleCostClockP50Ns));
+		auto moveCalibratedNs = EstimateParticleMovementNs(frame, particleCostClockBatchMeanMedianNs);
+		auto fixedNs = int64_t(frame.updateNs) - int64_t(classSumNs);
+		auto classCoverageErrorNs = int64_t(frame.loopNs) - int64_t(classSumNs);
+		auto remainderRawNs = int64_t(frame.updateNs) - int64_t(moveRawNs);
+		auto remainderMinNs = int64_t(frame.updateNs) - int64_t(moveMinNs);
+		auto remainderP50Ns = int64_t(frame.updateNs) - int64_t(moveP50Ns);
+		auto remainderCalibratedNs = int64_t(frame.updateNs) - int64_t(moveCalibratedNs);
+		particleCostFrameCounter += 1;
+		std::fprintf(particleCostFile,
+			"%d,%llu,%llu,%llu,%llu,%lld,%lld,%lld,%llu,%lld,%llu,%lld,%llu,%lld,%llu,%d,%llu,%llu,%.6f,%d,%d,"
+			"%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",
+			particleCostFrameCounter,
+			(unsigned long long)frame.updateCalls,
+			(unsigned long long)frame.updateNs,
+			(unsigned long long)frame.loopNs,
+			(unsigned long long)classSumNs,
+			(long long)fixedNs,
+			(long long)classCoverageErrorNs,
+			(long long)remainderRawNs,
+			(unsigned long long)moveRawNs,
+			(long long)remainderMinNs,
+			(unsigned long long)moveMinNs,
+			(long long)remainderP50Ns,
+			(unsigned long long)moveP50Ns,
+			(long long)remainderCalibratedNs,
+			(unsigned long long)moveCalibratedNs,
+			particleCostSampleStride,
+			(unsigned long long)particleCostClockMinNs,
+			(unsigned long long)particleCostClockP50Ns,
+			particleCostClockBatchMeanMedianNs,
+			ParticleCostClockCalibrationBatches,
+			ParticleCostClockCalibrationSamplesPerBatch,
+			(unsigned long long)frame.slotsSeen,
+			(unsigned long long)frame.liveSeen,
+			(unsigned long long)frame.deadSlots,
+			(unsigned long long)frame.classSwitches,
+			(unsigned long long)movementCalls,
+			(unsigned long long)sampledMovementCalls,
+			(unsigned long long)frame.tryMoveCalls,
+			(unsigned long long)frame.doMoveCalls,
+			(unsigned long long)frame.lateralVerticalEntries,
+			(unsigned long long)frame.lateralGravityEntries,
+			(unsigned long long)frame.lateralSearchSteps,
+			(unsigned long long)frame.elementUpdateCalls,
+			(unsigned long long)frame.entryMovementClassChanges,
+			(unsigned long long)frame.candidateToFluidChanges);
+		for (size_t i = 0; i < ParticleCostClassCount; ++i)
+		{
+			std::fprintf(particleCostFile, ",%llu,%llu,%llu,%llu,%llu",
+				(unsigned long long)frame.classCount[i],
+				(unsigned long long)frame.classNs[i],
+				(unsigned long long)frame.movementCalls[i],
+				(unsigned long long)frame.sampledMovementCalls[i],
+				(unsigned long long)frame.sampledMovementRawNs[i]);
+		}
+		std::fprintf(particleCostFile, "\n");
+		std::fflush(particleCostFile);
+		particleCostPending = {};
+		particleCostPendingReady = false;
+	}
+
 	// * Contadores do frame corrente. serialType = leitura ilimitada; serialMove = escrita
 	//   longa prevista; mispredict = classificado como paralelo mas que ANDOU mais que o
 	//   halo, ou seja, falha de seguranca do preditor. Esse ultimo e o numero que decide se
@@ -2534,6 +3011,9 @@ namespace
 
 void SimulationImpl::UpdateParticles(int start, int end)
 {
+	// * Declared before the FrameTime span so its destructor samples the end only after the
+	//   outer span has closed. CSV I/O is deferred to AfterSim and never enters this timing.
+	ParticleCostProbe costProbe(this);
 	FrameTime::Span span(frameTime, "Simulation::UpdateParticles");
 	ReachProbe reachProbe(parts.data.data());
 	// * Dentro do laco o RNG e re-semeado por particula, o que descarta o estado corrente.
@@ -2575,9 +3055,11 @@ void SimulationImpl::UpdateParticles(int start, int end)
 	//the main particle loop function, goes over all particles.
 	auto &sd = SimulationData::CRef();
 	auto &elements = sd.elements;
+	costProbe.BeginLoop();
 	for (auto i = start; i < end && i < parts.active; i++)
 	{
 		auto t = parts[i].type;
+		costProbe.EnterSlot(t, elements);
 		if (!t)
 		{
 			continue;
@@ -2761,6 +3243,7 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		//call the particle update function, if there is one
 		if (elements[t].Update)
 		{
+			costProbe.RecordElementUpdate();
 			if ((*(elements[t].Update))(this, i, x, y, neighbourhood.surround_space, neighbourhood.nt, parts, pmap))
 				continue;
 			x = int(parts[i].x+0.5f);
@@ -2779,8 +3262,21 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		if (!parts[i].vx&&!parts[i].vy)//if its not moving, skip to next particle, movement code it next
 			continue;
 
-		MovementPhase(i, neighbourhood);
+		if (costProbe.ShouldSampleMovement(i, parts[i].type, elements))
+		{
+			// Keep the measurement boundary at the call site. Helper returns and sampling
+			// branches must not be multiplied by the sampling stride as movement work.
+			auto movementStartedAt = ParticleCostClock::now();
+			MovementPhase(i, neighbourhood);
+			auto movementEndedAt = ParticleCostClock::now();
+			costProbe.RecordMovement(movementEndedAt - movementStartedAt);
+		}
+		else
+		{
+			MovementPhase(i, neighbourhood);
+		}
 	}
+	costProbe.EndLoop();
 }
 
 bool SimulationImpl::TransitionPhase(int i, const Neighbourhood &neighbourhood)
@@ -3557,6 +4053,10 @@ void SimulationImpl::MovementPhase(int i, Neighbourhood neighbourhood)
 				}
 				if (elements[t].Falldown>1 && !grav && gravityMode==GRAV_VERTICAL && parts[i].vy>fabsf(parts[i].vx))
 				{
+					if (particleCostCollecting)
+					{
+						particleCostWorking.lateralVerticalEntries += 1;
+					}
 					auto s = 0;
 					// stagnant is true if FLAG_STAGNANT was set for this particle in previous frame
 					int rt;
@@ -3571,6 +4071,10 @@ void SimulationImpl::MovementPhase(int i, Neighbourhood neighbourhood)
 					auto nx = -1, ny = -1;
 					for (auto j=clear_x+r; j>=0 && j>=clear_x-rt && j<clear_x+rt && j<XRES; j+=r)
 					{
+						if (particleCostCollecting)
+						{
+							particleCostWorking.lateralSearchSteps += 1;
+						}
 						if ((TYP(pmap[fin_y][j])!=t || bmap[fin_y/CELL][j/CELL])
 							&& (s=do_move(i, x, y, (float)j, fin_yf)))
 						{
@@ -3594,6 +4098,10 @@ void SimulationImpl::MovementPhase(int i, Neighbourhood neighbourhood)
 					if (s==1)
 						for (auto j=ny+r; j>=0 && j<YRES && j>=ny-rt && j<ny+rt; j+=r)
 						{
+							if (particleCostCollecting)
+							{
+								particleCostWorking.lateralSearchSteps += 1;
+							}
 							if ((TYP(pmap[j][nx])!=t || bmap[j/CELL][nx/CELL]) && do_move(i, nx, ny, (float)nx, (float)j))
 								break;
 							if (TYP(pmap[j][nx])!=t || (bmap[j/CELL][nx/CELL] && bmap[j/CELL][nx/CELL]!=WL_STREAM))
@@ -3607,6 +4115,10 @@ void SimulationImpl::MovementPhase(int i, Neighbourhood neighbourhood)
 				}
 				else if (elements[t].Falldown>1 && fabsf(pGravX*parts[i].vx+pGravY*parts[i].vy)>fabsf(pGravY*parts[i].vx-pGravX*parts[i].vy))
 				{
+					if (particleCostCollecting)
+					{
+						particleCostWorking.lateralGravityEntries += 1;
+					}
 					float nxf, nyf, prev_pGravX, prev_pGravY, ptGrav = elements[t].Gravity;
 					auto s = 0;
 					// stagnant is true if FLAG_STAGNANT was set for this particle in previous frame
@@ -3622,6 +4134,10 @@ void SimulationImpl::MovementPhase(int i, Neighbourhood neighbourhood)
 					// Look for spaces to move horizontally (perpendicular to gravity direction), keep going until a space is found or the number of positions examined = rt
 					for (auto j=0;j<rt;j++)
 					{
+						if (particleCostCollecting)
+						{
+							particleCostWorking.lateralSearchSteps += 1;
+						}
 						// Calculate overall gravity direction
 						GetGravityField(nx, ny, ptGrav, 1.0f, pGravX, pGravY);
 						// Scale gravity vector so that the largest component is 1 pixel
@@ -3674,6 +4190,10 @@ void SimulationImpl::MovementPhase(int i, Neighbourhood neighbourhood)
 						clear_y = ny;
 						for (auto j=0;j<rt;j++)
 						{
+							if (particleCostCollecting)
+							{
+								particleCostWorking.lateralSearchSteps += 1;
+							}
 							// Calculate overall gravity direction
 							GetGravityField(nx, ny, ptGrav, 1.0f, pGravX, pGravY);
 							// Scale gravity vector so that the largest component is 1 pixel
@@ -4340,6 +4860,9 @@ namespace
 
 void Simulation::AfterSim()
 {
+	// * Fixed-schema cost probe output. UpdateParticles only accumulates in memory; doing the
+	//   file write here keeps disk I/O outside the measured hot loop.
+	DumpParticleCostFrame(this);
 	if (!checksumChecked)
 	{
 		checksumChecked = true;
@@ -4444,7 +4967,10 @@ void Simulation::AfterSim()
 	frameCount += 1;
 }
 
-Simulation::~Simulation() = default;
+Simulation::~Simulation()
+{
+	ReleaseParticleCostOwner(this);
+}
 
 Simulation::Simulation()
 {

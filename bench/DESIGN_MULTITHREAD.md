@@ -3,6 +3,16 @@
 Documento de desenho para o mod. Todas as afirmações numéricas vêm das medições
 em `README.md` desta pasta; onde algo é hipótese, está marcado como tal.
 
+> **Status:** desenho histórico, invalidado no estágio 3. O deslocamento longo de
+> OIL depende de trocas repetidas com partículas processadas depois dele e não é
+> previsível no despacho anterior ao update. As medições de quebra de custo
+> limitaram “só pós/sólidos” a 1,67x mesmo com threads infinitas. O restante fora
+> de `MovementPhase` tem 56,01% do custo e teto infinito de 2,27x no update, mas
+> dá só 1,85x na simulação com oito threads e não é uma fase segura: callbacks de
+> elemento dentro dele escrevem `pmap`, criam, matam e movem partículas. Não
+> implementar o estágio 4 descrito abaixo; ver `README.md` para a evidência e a
+> decisão atuais.
+
 ## Objetivo e não-objetivos
 
 **Objetivo:** com 143 mil partículas, sair de 24 FPS para 60 FPS, reduzindo
@@ -31,13 +41,13 @@ mesmo estado. Sem isso não há como testar nada.
 | busca lateral de líquidos `rt = 30` (leitura e escrita) | halo mínimo de 32 px |
 | 62 elementos leem raio 1, 36 leem raio 2, STKM 4 | varredura de elemento cabe no halo |
 | `DTEC` limitado a 25 px | cabe no halo |
-| OIL chegou a 280 px num frame, por advecção | **não** dá para excluir por tipo |
+| OIL chegou a 280 px num frame, por trocas repetidas posteriores | **não** dá para prever o destino antes do update |
 | `MAX_VELOCITY = 1e4` px/frame | o clamp de velocidade não dá limite útil |
 | `LDTC`, `ETRD`, raios, `WIFI`, portais, `EMP` sem localidade | exclusão por tipo, passe serial |
 
 A assimetria central: **leitura longa é enumerável por tipo; escrita longa não
-é**, porque vem de matéria comum arremessada por pressão. Daí duas regras
-distintas de despacho.
+é**, porque matéria comum pode ser reposicionada repetidamente por trocas com
+partículas processadas depois dela. Daí duas regras distintas de despacho.
 
 ## Inventário de perigos (estado mutável compartilhado)
 
