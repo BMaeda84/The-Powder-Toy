@@ -165,6 +165,54 @@ execuções mostraram dispersão de **9,6%** entre si, contra uma diferença de
 em `UpdateParticles` é da ordem de 10%. Qualquer ganho reivindicado no estágio 4
 precisa ficar bem acima disso, e medido com repetições, para ser levado a sério.
 
+## Lista livre segmentada (estágio 2)
+
+`pfree` era um único LIFO encadeado por `data[i].life`. `Alloc` e `Free` vindos de
+threads diferentes corromperiam o encadeamento, e qualquer matéria comum aloca e
+libera — o perigo não é excluível por tipo como os elementos de alcance global.
+
+Agora há uma lista por segmento. `Free` devolve ao segmento **de quem chamou**, não
+a um derivado do índice: assim uma thread nunca escreve na lista de outra, mesmo
+matando partícula criada por outra. Se o segmento próprio estiver vazio, `Alloc`
+varre os demais em ordem fixa antes de crescer `active` — sem esse resgate, slots
+liberados por outra thread ficariam encalhados e a simulação bateria no teto de
+partículas com memória sobrando.
+
+`TPT_FREELIST_SEGMENTS` define a contagem (padrão 1, idêntico ao original) e
+`TPT_FREELIST_BANDING=1` atribui o segmento pela faixa vertical da partícula,
+simulando em série o que o estágio 4 fará com uma thread por faixa.
+
+### O teste que quase passou sem testar nada
+
+Com o cenário de bench, todas as configurações davam o mesmo checksum e
+integridade perfeita. Parecia aprovado. Os contadores `local_alloc` e `rescue`
+mostraram **`alloc_local = 0`**: as ~36k partículas vieram todas de incrementar
+`active`, a lista livre nunca foi usada para alocar, e portanto o código novo
+jamais rodou.
+
+Daí `churn_autorun.lua`, que cria e destrói matéria todo frame em faixas
+rotativas, mantendo a população estável para forçar alocação vinda da lista.
+
+### Verificação
+
+| teste | resultado |
+|---|---|
+| 1 segmento, cena de bench | checksum idêntico ao estágio 1 (`8eba5a5720c39d06`) |
+| cena de rotatividade, 1 segmento | 13.305 alocações pela lista livre |
+| cena de rotatividade, 8 segmentos + banding | 13.432 alocações; partição realmente exercitada |
+| 8 segmentos, 2 execuções | idênticas nos 300 frames |
+| integridade, todas as execuções | 0 frames com corrupção em 300 |
+
+O checksum com banding difere do de 1 segmento (`89f80832…` vs `783ea282…`), como
+esperado: a atribuição de slots muda. A população fica em 3.883 contra 3.893,
+diferença de 0,26%.
+
+**Lacuna assumida:** `rescue = 0` em todas as execuções. O caminho de resgate entre
+segmentos nunca disparou, porque cada faixa sempre achou slot na própria lista.
+É bom sinal para a contenção esperada no estágio 4, mas significa que esse ramo
+continua **sem teste**. Precisa de um cenário com faixas assimétricas — uma que
+só destrói e outra que só cria.
+
 ## Alcance de leitura (análise estática)
 
 O `pmap` é `int[YRES][XRES]` cru e os elementos o recebem como `int (*)[XRES]`

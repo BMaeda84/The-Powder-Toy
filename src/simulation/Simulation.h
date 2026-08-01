@@ -37,7 +37,29 @@ class GameSave;
 
 class Parts
 {
-	int pfree;
+public:
+	// * Teto de segmentos da lista livre: um por thread no estagio 4.
+	static constexpr int MaxFreeSegments = 16;
+
+private:
+	// * A lista livre era um unico LIFO encadeado por data[i].life. Alloc e Free vindos de
+	//   threads diferentes corromperiam esse encadeamento, e qualquer materia comum aloca e
+	//   libera, entao o perigo nao e excluivel por tipo como os elementos de alcance global.
+	//   Segmentando, cada thread mexe so na propria lista e some a escrita compartilhada no
+	//   caminho quente. Com freeSegments = 1 o comportamento e identico ao original.
+	std::array<int, MaxFreeSegments> pfree;
+	int freeSegments = 1;
+	int currentSegment = 0;
+
+public:
+	// * Quantas vezes a alocacao teve de pegar slot de outro segmento. Serve para saber se
+	//   um teste realmente exercitou a particao ou se o cenario tinha rotatividade baixa
+	//   demais para sair do segmento proprio. Zero num teste = teste inconclusivo.
+	long long rescueCount = 0;
+	// * Quantos alocamentos vieram do segmento proprio (caminho rapido).
+	long long localAllocCount = 0;
+
+private:
 
 public:
 	std::array<Particle, NPART> data;
@@ -66,6 +88,8 @@ public:
 		std::copy(other.data.begin(), other.data.begin() + other.active, data.begin());
 		active = other.active;
 		pfree = other.pfree;
+		freeSegments = other.freeSegments;
+		currentSegment = other.currentSegment;
 		return *this;
 	}
 
@@ -77,9 +101,36 @@ public:
 	int Alloc();
 	void Flatten();
 
+	// * Configuracao da segmentacao. SetFreeSegments so faz sentido com as listas vazias;
+	//   mudar com materia viva exigiria redistribuir encadeamentos ja construidos.
+	void SetFreeSegments(int count);
+	int FreeSegments() const
+	{
+		return freeSegments;
+	}
+	void SetCurrentSegment(int segment)
+	{
+		currentSegment = segment;
+	}
+
+	// * Checagem de integridade: detecta slot vivo dentro de uma lista livre, slot presente
+	//   em duas listas e ciclo no encadeamento. Cara, roda so sob TPT_VALIDATE_FREELIST.
+	bool ValidateFreeLists(int &freeCount) const;
+
 	bool MaxPartsReached() const
 	{
-		return pfree == -1 && active >= NPART;
+		if (active < NPART)
+		{
+			return false;
+		}
+		for (auto segment = 0; segment < freeSegments; segment++)
+		{
+			if (pfree[segment] != -1)
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 };
 

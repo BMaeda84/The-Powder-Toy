@@ -1015,7 +1015,49 @@ void Parts::Reset()
 {
 	memset(data.data(), 0, sizeof(Particle)*NPART);
 	active = 0;
-	pfree = -1;
+	pfree.fill(-1);
+	currentSegment = 0;
+	// * Numero de segmentos por ambiente. Resolvido uma vez; o padrao 1 reproduz exatamente
+	//   a lista unica original, entao jogo normal nao muda ate alguem pedir o contrario.
+	static const int segmentsFromEnv = []() {
+		if (auto *env = std::getenv("TPT_FREELIST_SEGMENTS"))
+		{
+			return std::atoi(env);
+		}
+		return 1;
+	}();
+	SetFreeSegments(segmentsFromEnv);
+}
+
+void Parts::SetFreeSegments(int count)
+{
+	freeSegments = std::max(1, std::min(count, MaxFreeSegments));
+}
+
+bool Parts::ValidateFreeLists(int &freeCount) const
+{
+	std::vector<char> seen(NPART, 0);
+	freeCount = 0;
+	for (auto segment = 0; segment < freeSegments; segment++)
+	{
+		auto guard = 0;
+		for (auto i = pfree[segment]; i != -1; i = data[i].life)
+		{
+			// * Indice fora de faixa, slot ja visto (duplicata entre listas ou ciclo) ou
+			//   slot com tipo vivo dentro da lista livre sao todos corrupcao.
+			if (i < 0 || i >= NPART || seen[i] || data[i].type)
+			{
+				return false;
+			}
+			seen[i] = 1;
+			freeCount += 1;
+			if (++guard > NPART)
+			{
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 void Simulation::clear_sim(void)
@@ -1793,8 +1835,11 @@ void Simulation::kill_part(int i)//kills particle number i
 void Parts::Free(int i)
 {
 	data[i].type = PT_NONE;
-	data[i].life = pfree;
-	pfree = i;
+	// * Devolve ao segmento de quem chamou, nao a um segmento derivado do indice. Isso e o
+	//   ponto da segmentacao: uma thread nunca escreve na lista de outra, mesmo matando uma
+	//   particula que outra thread tenha criado.
+	data[i].life = pfree[currentSegment];
+	pfree[currentSegment] = i;
 }
 
 // Changes the type of particle number i, to t.  This also changes pmap at the same time
@@ -2002,11 +2047,26 @@ int Simulation::createPartTempVel(int i, int x, int y, int t)
 
 int Parts::Alloc()
 {
-	if (pfree != -1)
+	if (pfree[currentSegment] != -1)
 	{
-		auto i = pfree;
-		pfree = data[i].life;
+		auto i = pfree[currentSegment];
+		pfree[currentSegment] = data[i].life;
+		localAllocCount += 1;
 		return i;
+	}
+	// * Segmento proprio vazio: varre os demais em ordem fixa antes de crescer `active`.
+	//   Sem esse resgate, slots liberados por outra thread ficariam encalhados e a simulacao
+	//   bateria no teto de particulas com memoria livre sobrando. A ordem fixa mantem o
+	//   resultado deterministico.
+	for (auto segment = 0; segment < freeSegments; segment++)
+	{
+		if (pfree[segment] != -1)
+		{
+			auto i = pfree[segment];
+			pfree[segment] = data[i].life;
+			rescueCount += 1;
+			return i;
+		}
 	}
 	if (active < NPART)
 	{
@@ -2409,6 +2469,14 @@ void SimulationImpl::UpdateParticles(int start, int end)
 	//   esse fluxo intacto em vez de deixa-lo com o resto da ultima particula processada.
 	auto savedRngState = rng.state();
 	Defer restoreRngState([this, savedRngState]() { rng.state(savedRngState); });
+	// * Ativa a atribuicao de segmento por faixa (ver dentro do laco). Fora do laco o
+	//   segmento volta a 0, porque criacao vinda de ferramentas e save/load nao pertence a
+	//   faixa nenhuma.
+	static const bool freeListBanding = []() {
+		auto *env = std::getenv("TPT_FREELIST_BANDING");
+		return env && std::atoi(env) != 0;
+	}();
+	Defer resetSegment([this]() { parts.SetCurrentSegment(0); });
 	//the main particle loop function, goes over all particles.
 	auto &sd = SimulationData::CRef();
 	auto &elements = sd.elements;
@@ -2427,6 +2495,16 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		//   particula: o resultado deixa de depender da ordem de visita, do particionamento
 		//   e ate do numero de threads.
 		rng.seedFrom(uint64_t(currentTick), uint64_t(i));
+		// * Ainda em execucao serial, mas atribuindo o segmento da lista livre pela faixa
+		//   vertical em que a particula esta, que e exatamente o que o estagio 4 fara com
+		//   uma thread por faixa. Sem isto a segmentacao nunca sai do segmento 0 e o codigo
+		//   novo passa no teste sem nunca ter sido exercitado: em particular o resgate entre
+		//   segmentos, que so dispara quando uma faixa libera mais do que aloca.
+		if (freeListBanding)
+		{
+			auto band = int(parts[i].x) * parts.FreeSegments() / XRES;
+			parts.SetCurrentSegment(std::max(0, std::min(band, parts.FreeSegments() - 1)));
+		}
 		debug_mostRecentlyUpdated = i;
 
 		auto x = int(parts[i].x+0.5f);
@@ -3546,7 +3624,11 @@ void Simulation::RecalcFreeParticles(bool do_life_dec)
 void Parts::Flatten()
 {
 	int newActive = 0;
-	auto *ppfree = &pfree;
+	// * Compactacao descarta o encadeamento anterior e reconstroi tudo num unico segmento.
+	//   E chamada fora do caminho quente, entao concentrar no segmento 0 e suficiente: os
+	//   demais voltam a se encher naturalmente conforme cada thread libera slots.
+	pfree.fill(-1);
+	auto *ppfree = &pfree[0];
 	for (int i = 0; i < active; i++)
 	{
 		if (data[i].type)
@@ -4094,7 +4176,7 @@ void Simulation::AfterSim()
 			checksumFile = std::fopen(path, "w");
 			if (checksumFile)
 			{
-				std::fprintf(checksumFile, "frame,live,checksum\n");
+				std::fprintf(checksumFile, "frame,live,checksum,freelist_ok,freelist_count,segments,local_alloc,rescue\n");
 			}
 		}
 	}
@@ -4126,8 +4208,16 @@ void Simulation::AfterSim()
 		sum.feedBytes(vx, sizeof(vx));
 		sum.feedBytes(vy, sizeof(vy));
 		sum.feedBytes(hv, sizeof(hv));
+		// * Integridade da lista livre segmentada. Corrupcao aqui (slot vivo na lista, slot
+		//   em duas listas, ciclo) e silenciosa: nao trava, so faz duas particulas passarem
+		//   a compartilhar o mesmo slot. Verificar por frame e caro, mas este caminho ja e
+		//   de diagnostico, e o custo so existe com o checksum ligado.
+		int freeCount = 0;
+		bool freeOk = parts.ValidateFreeLists(freeCount);
 		checksumFrame += 1;
-		std::fprintf(checksumFile, "%d,%d,%016llx\n", checksumFrame, live, (unsigned long long)sum.hash);
+		std::fprintf(checksumFile, "%d,%d,%016llx,%d,%d,%d,%lld,%lld\n", checksumFrame, live,
+			(unsigned long long)sum.hash, freeOk ? 1 : 0, freeCount, parts.FreeSegments(),
+			parts.localAllocCount, parts.rescueCount);
 		std::fflush(checksumFile);
 	}
 
