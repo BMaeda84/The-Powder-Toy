@@ -80,4 +80,28 @@ void RNG::seed(unsigned int sd)
 	s[1] = sd;
 }
 
+void RNG::seedFrom(uint64_t a, uint64_t b)
+{
+	// * xoroshiro128+ tem qualidade ruim nos primeiros valores quando semeado com estados
+	//   proximos, e seed() acima faz s[0] = s[1] = sd, que e justamente o caso ruim. Como
+	//   aqui as sementes sao vizinhas por construcao (indices consecutivos de particula),
+	//   usar seed() produziria correlacao visivel entre particulas adjacentes.
+	//   splitmix64 e o misturador recomendado pelos autores do xoroshiro para inicializacao:
+	//   duas passagens dao dois words descorrelacionados mesmo para entradas vizinhas.
+	uint64_t x = a * UINT64_C(0x9E3779B97F4A7C15) + b;
+	auto splitmix64 = [&x]() {
+		uint64_t z = (x += UINT64_C(0x9E3779B97F4A7C15));
+		z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+		z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+		return z ^ (z >> 31);
+	};
+	s[0] = splitmix64();
+	s[1] = splitmix64();
+	// * xoroshiro exige estado nao-nulo; a chance e desprezivel mas o custo de garantir e zero.
+	if (!s[0] && !s[1])
+	{
+		s[0] = 1;
+	}
+}
+
 RNG interfaceRng;

@@ -22,6 +22,10 @@ public:
 	RNG();
 	void seed(unsigned int sd);
 
+	// * Semeia a partir de dois contadores (por exemplo tick e indice de particula),
+	//   produzindo um fluxo independente da ordem em que as partículas forem visitadas.
+	void seedFrom(uint64_t a, uint64_t b);
+
 	void state(State ns)
 	{
 		s = ns;

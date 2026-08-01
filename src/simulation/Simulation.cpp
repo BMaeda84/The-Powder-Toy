@@ -2403,6 +2403,12 @@ void SimulationImpl::UpdateParticles(int start, int end)
 {
 	FrameTime::Span span(frameTime, "Simulation::UpdateParticles");
 	ReachProbe reachProbe(parts.data.data());
+	// * Dentro do laco o RNG e re-semeado por particula, o que descarta o estado corrente.
+	//   Simulation::rng tambem e usado fora do laco (BeforeSim, CheckStacking, ferramentas),
+	//   e esses usuarios continuam num fluxo sequencial proprio; salvar e restaurar mantem
+	//   esse fluxo intacto em vez de deixa-lo com o resto da ultima particula processada.
+	auto savedRngState = rng.state();
+	Defer restoreRngState([this, savedRngState]() { rng.state(savedRngState); });
 	//the main particle loop function, goes over all particles.
 	auto &sd = SimulationData::CRef();
 	auto &elements = sd.elements;
@@ -2413,6 +2419,14 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		{
 			continue;
 		}
+		// * Fluxo de aleatorios proprio desta particula neste tick. O laco compartilhava um
+		//   unico RNG, entao os numeros que cada particula recebia dependiam de quantas
+		//   chamadas as anteriores tinham feito, isto e, da ordem de visita. Sob threads
+		//   isso e corrida de dados e destroi a reprodutibilidade.
+		//   Semeando por (tick, indice) o fluxo passa a ser funcao apenas da identidade da
+		//   particula: o resultado deixa de depender da ordem de visita, do particionamento
+		//   e ate do numero de threads.
+		rng.seedFrom(uint64_t(currentTick), uint64_t(i));
 		debug_mostRecentlyUpdated = i;
 
 		auto x = int(parts[i].x+0.5f);

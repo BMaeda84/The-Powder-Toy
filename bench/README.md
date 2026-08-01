@@ -123,6 +123,48 @@ $env:TPT_RNG_SEED     = "12345"
 $env:TPT_CHECKSUM_CSV = "$d\checksum.csv"
 ```
 
+## RNG por partícula (estágio 1)
+
+O laço compartilhava um único `Simulation::rng`. Os números que cada partícula
+recebia dependiam de quantas chamadas as anteriores tinham feito — ou seja, da
+ordem de visita. Sob threads isso é corrida de dados e destrói a
+reprodutibilidade.
+
+Agora cada partícula é semeada por `(currentTick, índice)` via `RNG::seedFrom`,
+que usa splitmix64. O misturador não é enfeite: xoroshiro128+ tem qualidade ruim
+nos primeiros valores quando semeado com estados próximos, e `seed()` faz
+`s[0] = s[1] = sd`, que é exatamente o caso ruim. Como aqui as sementes são
+vizinhas por construção (índices consecutivos), usar `seed()` produziria
+correlação visível entre partículas adjacentes.
+
+O estado global de `rng` é salvo e restaurado em volta do laço, porque
+`BeforeSim`, `CheckStacking` e as ferramentas seguem num fluxo sequencial próprio.
+
+### Consequência de desenho
+
+O fluxo passa a ser função apenas da **identidade** da partícula. Logo o
+resultado independe da ordem de visita, do particionamento em faixas **e do
+número de threads**. Isso corrige o que o `DESIGN_MULTITHREAD.md` dizia
+originalmente sobre número de threads virar parâmetro do save: com semeadura por
+partícula, não vira.
+
+### Verificação
+
+| teste | resultado |
+|---|---|
+| 3 execuções, semente 12345, 300 frames | idênticas: `8eba5a5720c39d06` |
+| checksum vs. estágio 0 | diferente (`7d0c66a2…`), como esperado |
+| trajetória de população vs. estágio 0 | idêntica até o frame ~250; divergência máxima de 13 partículas (0,036%) |
+| custo em `UpdateParticles` (cena densa) | não mensurável acima do ruído |
+
+Sobre o custo: uma execução isolada sugeriu −3,4%, o que seria um ganho. Três
+execuções mostraram dispersão de **9,6%** entre si, contra uma diferença de
++0,3% em relação à baseline. Não há base para afirmar ganho nem custo.
+
+**Calibração importante para os próximos estágios:** o ruído execução a execução
+em `UpdateParticles` é da ordem de 10%. Qualquer ganho reivindicado no estágio 4
+precisa ficar bem acima disso, e medido com repetições, para ser levado a sério.
+
 ## Alcance de leitura (análise estática)
 
 O `pmap` é `int[YRES][XRES]` cru e os elementos o recebem como `int (*)[XRES]`

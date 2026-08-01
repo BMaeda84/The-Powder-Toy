@@ -107,7 +107,7 @@ serial custa desempenho; errar para o outro lado corrompe estado.
 
 | perigo | solução |
 |---|---|
-| RNG único | RNG por faixa, semeado por `(frame, índice da faixa)`. Determinístico e independente do escalonador. Muda a sequência de números vs. o TPT serial — aceito. |
+| RNG único | **Implementado no estágio 1, e melhor do que o previsto aqui:** semeadura por *partícula*, via `(currentTick, índice)` com splitmix64, em vez de por faixa. Muda a sequência vs. o TPT serial — aceito. |
 | Lista livre | Particionar `pfree` em N segmentos fixos, um por thread. Alocação e liberação ficam no segmento dono. Preserva visibilidade imediata da partícula criada, ao contrário de fila diferida. |
 | Grid de ar | Coberto pela posse de faixa, já que `CELL = 4` ≪ halo. |
 | `elementCount[]` | Acumular por thread, somar no fim do frame. |
@@ -122,8 +122,18 @@ faixa (função de frame e faixa, fixa) e segmento da lista livre (fixo). Nenhum
 desses depende do escalonador. Logo o resultado é reproduzível para um dado
 número de threads.
 
-**Importante:** mudar o número de threads muda o resultado, porque muda o
-particionamento. O número de threads passa a ser parâmetro do save.
+**Corrigido no estágio 1:** este documento afirmava originalmente que mudar o
+número de threads mudaria o resultado, por mudar o particionamento. Com a
+semeadura de RNG por partícula que acabou sendo implementada, o fluxo de
+aleatórios é função apenas da identidade da partícula, e não do particionamento.
+Some-se a isso que a ordem de iteração *dentro* de cada faixa continua sendo a de
+índice, e o resultado deixa de depender do número de threads. O número de threads
+**não** vira parâmetro do save.
+
+Ressalva honesta: isso vale para o fluxo de aleatórios, que era o acoplamento mais
+óbvio. Se restar alguma dependência de ordem *entre* faixas — matéria que cruza
+fronteira, por exemplo — ela ainda pode reintroduzir sensibilidade ao
+particionamento. Só o estágio 3 permitirá afirmar isso com medição.
 
 ## Estágios (cada um verificável isoladamente)
 
