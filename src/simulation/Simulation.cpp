@@ -17,6 +17,7 @@
 #include "elements/FILT.h"
 #include "elements/PRTI.h"
 #include "elements/PLNT.h"
+#include <cstdio> // DIAG: sonda de acesso fora dos limites (branch diag/wire-oob)
 #include <iostream>
 #include <numbers>
 #include <set>
@@ -854,13 +855,36 @@ void Simulation::CreateLine(int x1, int y1, int x2, int y2, int c)
 	}
 }
 
+// DIAGNOSTICO TEMPORARIO (branch diag/wire-oob, nao e para merge).
+//
+// bmap e emap sao unsigned char[YCELLS][XCELLS], sem linha de borda. Um acesso
+// com y == -1 nao estoura a pagina: cai no membro anterior do objeto (hv), entao
+// le lixo silenciosamente em vez de crashar. Por isso o bug nao aparece sozinho —
+// esta sonda existe justamente para torna-lo observavel.
+static void DiagWireProbe(const char *who, int x, int y)
+{
+	if (x >= 0 && x < XCELLS && y >= 0 && y < YCELLS)
+		return;
+	static int count = 0;
+	count++;
+	if (count > 50) // basta provar que ocorre; nao inundar o arquivo
+		return;
+	if (FILE *f = fopen("wire_oob.txt", "a"))
+	{
+		fprintf(f, "%s fora dos limites: x=%d y=%d (XCELLS=%d YCELLS=%d)\n", who, x, y, XCELLS, YCELLS);
+		fclose(f);
+	}
+}
+
 inline int Simulation::is_wire(int x, int y)
 {
+	DiagWireProbe("is_wire", x, y);
 	return bmap[y][x]==WL_DETECT || bmap[y][x]==WL_EWALL || bmap[y][x]==WL_ALLOWLIQUID || bmap[y][x]==WL_WALLELEC || bmap[y][x]==WL_ALLOWALLELEC || bmap[y][x]==WL_EHOLE || bmap[y][x]==WL_STASIS;
 }
 
 inline int Simulation::is_wire_off(int x, int y)
 {
+	DiagWireProbe("is_wire_off", x, y);
 	return (bmap[y][x]==WL_DETECT || bmap[y][x]==WL_EWALL || bmap[y][x]==WL_ALLOWLIQUID || bmap[y][x]==WL_WALLELEC || bmap[y][x]==WL_ALLOWALLELEC || bmap[y][x]==WL_EHOLE || bmap[y][x]==WL_STASIS) && emap[y][x]<8;
 }
 
@@ -929,6 +953,22 @@ int Simulation::get_wavelength_bin(int *wm)
 void Simulation::set_emap(int x, int y)
 {
 	int x1, x2;
+
+	// DIAG: registra toda entrada em set_emap, para separar "nunca foi chamado"
+	// de "foi chamado mas nao chegou ao acesso fora dos limites". Sem isso, a
+	// ausencia da sonda e ambigua e nao prova nada.
+	{
+		static int calls = 0;
+		calls++;
+		if (calls <= 50)
+		{
+			if (FILE *f = fopen("set_emap_calls.txt", "a"))
+			{
+				fprintf(f, "set_emap(x=%d, y=%d) wire_off=%d\n", x, y, is_wire_off(x, y) ? 1 : 0);
+				fclose(f);
+			}
+		}
+	}
 
 	if (!is_wire_off(x, y))
 		return;
