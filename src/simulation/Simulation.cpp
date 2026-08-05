@@ -2315,6 +2315,14 @@ namespace
 		uint64_t cycTotal = 0, cycNeigh = 0, cycTrans = 0, cycUpdate = 0, cycMove = 0;
 		uint64_t particles = 0;
 		double wallUs = 0;
+		// sub-fases do TransitionPhase. O trabalho pesado esta todo atras do portao
+		// rng.chance(HeatConduct, 250), entao a taxa de passagem do portao explica
+		// tanto quanto o custo de cada bloco.
+		uint64_t tpGateSeen = 0, tpGatePassed = 0;
+		uint64_t partsConflicting = 0; // particulas que tocaram celula de outro pedaco
+		uint64_t cycTpConv = 0;   // conveccao de calor dos liquidos (GetGravityField)
+		uint64_t cycTpHeat = 0;   // laco dos 8 vizinhos + temperatura de equilibrio
+		uint64_t cycTpChange = 0; // as transicoes de fase propriamente ditas
 		// atribuicao do callback Update por tipo de elemento, acumulada em toda a corrida
 		uint64_t elemCycles[PT_NUM] = {};
 		uint64_t elemCalls[PT_NUM] = {};
@@ -2326,9 +2334,85 @@ namespace
 			cycTotal = cycNeigh = cycTrans = cycUpdate = cycMove = 0;
 			particles = 0;
 			wallUs = 0;
+			tpGateSeen = tpGatePassed = 0;
+			partsConflicting = 0;
+			cycTpConv = cycTpHeat = cycTpChange = 0;
 		}
 	};
 	UpdateProfile gProf;
+
+	// TAXA DE CONFLITO: se dividissemos o intervalo de IDs em NUM_CHUNKS pedacos
+	// contiguos, um por thread, com que frequencia duas particulas de pedacos
+	// DIFERENTES tocariam a mesma celula no mesmo frame?
+	//
+	// Esse e o numero que decide se paralelismo otimista (rodar tudo junto, detectar
+	// colisao, refazer o punhado que colidiu) tem chance. Se for baixo, nem e preciso
+	// prever nada. Ate agora mediu-se o ALCANCE (quao longe a particula vai), nunca a
+	// taxa de COLISAO.
+	//
+	// Marca-se uma vizinhanca 3x3 em torno da posicao inicial e da final: 3x3 porque
+	// 62 elementos leem raio 1 e e a leitura dominante. Raio 2 daria um limite
+	// superior; raio 0 (so a celula ocupada) daria um inferior.
+	constexpr int NUM_CHUNKS = 8;
+	uint8_t gOwner[YRES][XRES]; // 0 = intocada; senao pedaco+1
+	uint64_t gConflictCells = 0, gMarks = 0;
+
+	// Retorna true se esta celula ja pertencia a OUTRO pedaco.
+	inline bool ProfMark3x3(int cx, int cy, int chunk)
+	{
+		bool hit = false;
+		for (int dy = -1; dy <= 1; dy++)
+		{
+			for (int dx = -1; dx <= 1; dx++)
+			{
+				int x = cx + dx, y = cy + dy;
+				if (x < 0 || y < 0 || x >= XRES || y >= YRES)
+					continue;
+				gMarks++;
+				auto &o = gOwner[y][x];
+				if (!o)
+				{
+					o = uint8_t(chunk + 1);
+				}
+				else if (o != uint8_t(chunk + 1))
+				{
+					gConflictCells++;
+					hit = true;
+				}
+			}
+		}
+		return hit;
+	}
+
+	// Marca a posicao FINAL no destrutor, para cobrir tambem as particulas que saem
+	// da iteracao por `continue` antes de chegar ao fim do laco. O destrutor tambem
+	// fecha a contagem: se marcar a posicao final so depois de contar, o conflito de
+	// destino nao entraria na conta.
+	struct ProfConflictEnd
+	{
+		const Particle *p;
+		int chunk;
+		bool conflicted;
+		uint64_t *counter;
+		~ProfConflictEnd()
+		{
+			if (ProfMark3x3(int(p->x + 0.5f), int(p->y + 0.5f), chunk))
+				conflicted = true;
+			if (conflicted)
+				(*counter)++;
+		}
+	};
+
+	// Acumulador com escopo: soma o intervalo no destrutor. Necessario no bloco de
+	// transicoes porque ele tem quatro `return` antecipados; timestamps manuais no
+	// fim da funcao seriam pulados justamente nos casos em que algo aconteceu.
+	struct ProfScope
+	{
+		uint64_t start;
+		uint64_t &bucket;
+		explicit ProfScope(uint64_t &b) : start(__rdtsc()), bucket(b) {}
+		~ProfScope() { bucket += __rdtsc() - start; }
+	};
 }
 
 void SimulationImpl::UpdateParticles(int start, int end)
@@ -2340,6 +2424,10 @@ void SimulationImpl::UpdateParticles(int start, int end)
 	// 25,90 ms mostra quanto a propria sonda esta custando.
 	auto profWall0 = std::chrono::steady_clock::now();
 	auto profCyc0 = __rdtsc();
+	// mapa de posse zerado por frame: a pergunta e sobre colisao DENTRO de um frame
+	memset(gOwner, 0, sizeof(gOwner));
+	gConflictCells = 0;
+	gMarks = 0;
 
 	//the main particle loop function, goes over all particles.
 	auto &sd = SimulationData::CRef();
@@ -2405,6 +2493,11 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		}
 
 		gProf.particles++;
+
+		// pedaco contiguo do intervalo de IDs a que esta particula pertenceria
+		int profChunk = parts.active > 0 ? int(int64_t(i) * NUM_CHUNKS / parts.active) : 0;
+		ProfConflictEnd profEnd{ &parts[i], profChunk, ProfMark3x3(x, y, profChunk), &gProf.partsConflicting };
+
 		auto profNb0 = __rdtsc();
 		auto neighbourhood = GetNeighbourhood(i);
 		gProf.cycNeigh += __rdtsc() - profNb0;
@@ -2482,14 +2575,21 @@ void SimulationImpl::UpdateParticles(int start, int end)
 	{
 		if (!gProf.headerWritten)
 		{
-			fprintf(f, "frame,particulas,parede_us,cic_total,cic_vizinhanca,cic_transicao,cic_update,cic_movimento\n");
+			fprintf(f, "frame,particulas,parede_us,cic_total,cic_vizinhanca,cic_transicao,cic_update,cic_movimento,"
+				"tp_portao_visto,tp_portao_passou,cic_tp_conveccao,cic_tp_calor,cic_tp_mudanca,"
+				"conf_particulas,conf_celulas,conf_marcas\n");
 			gProf.headerWritten = true;
 		}
-		fprintf(f, "%d,%llu,%.1f,%llu,%llu,%llu,%llu,%llu\n", gProf.frame,
+		fprintf(f, "%d,%llu,%.1f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", gProf.frame,
 			(unsigned long long)gProf.particles, gProf.wallUs,
 			(unsigned long long)gProf.cycTotal, (unsigned long long)gProf.cycNeigh,
 			(unsigned long long)gProf.cycTrans, (unsigned long long)gProf.cycUpdate,
-			(unsigned long long)gProf.cycMove);
+			(unsigned long long)gProf.cycMove,
+			(unsigned long long)gProf.tpGateSeen, (unsigned long long)gProf.tpGatePassed,
+			(unsigned long long)gProf.cycTpConv, (unsigned long long)gProf.cycTpHeat,
+			(unsigned long long)gProf.cycTpChange,
+			(unsigned long long)gProf.partsConflicting,
+			(unsigned long long)gConflictCells, (unsigned long long)gMarks);
 		fclose(f);
 	}
 
@@ -2529,6 +2629,7 @@ bool SimulationImpl::TransitionPhase(int i, const Neighbourhood &neighbourhood)
 		if (t==PT_GEL)
 			gel_scale = parts[i].tmp*2.55f;
 
+		auto profTpConv0 = __rdtsc();
 		if ((elements[t].Properties&TYPE_LIQUID) && (t!=PT_GEL || gel_scale > (1 + rng.between(0, 254))))
 		{
 			float convGravX, convGravY;
@@ -2551,9 +2652,13 @@ bool SimulationImpl::TransitionPhase(int i, const Neighbourhood &neighbourhood)
 			}
 		}
 
+		gProf.cycTpConv += __rdtsc() - profTpConv0;
+
 		// Heat transfer code
+		gProf.tpGateSeen++;
 		if (t && !sd.IsHeatInsulator(parts[i]) && rng.chance(int(elements[t].HeatConduct*gel_scale), 250))
 		{
+			gProf.tpGatePassed++;
 			// Heat transfer with air
 			if (aheat_enable && !(elements[t].Properties&PROP_NOAMBHEAT))
 			{
@@ -2567,6 +2672,7 @@ bool SimulationImpl::TransitionPhase(int i, const Neighbourhood &neighbourhood)
 			}
 
 			// Heat transfer with other elements
+			auto profTpHeat0 = __rdtsc();
 			auto hc_total = 0.0f; // Total heat capacity of elements involved
 			auto c_heat = 0.0f; // Total heat distributed between elements
 			int surround_hconduct[8]; // IDs of elements which exchange heat
@@ -2610,6 +2716,9 @@ bool SimulationImpl::TransitionPhase(int i, const Neighbourhood &neighbourhood)
 			{
 				parts[surround_hconduct[j]].temp = pt;
 			}
+
+			gProf.cycTpHeat += __rdtsc() - profTpHeat0;
+			ProfScope profTpChangeScope(gProf.cycTpChange);
 
 			auto ctemph = pt;
 			auto ctempl = pt;
