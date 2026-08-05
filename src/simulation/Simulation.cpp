@@ -17,6 +17,9 @@
 #include "elements/FILT.h"
 #include "elements/PRTI.h"
 #include "elements/PLNT.h"
+#include <chrono>  // PERFIL: relogio de parede para calibrar os ciclos
+#include <cstdio>  // PERFIL: despejo do CSV
+#include <intrin.h> // PERFIL: __rdtsc (MSVC)
 #include <iostream>
 #include <numbers>
 #include <set>
@@ -2293,8 +2296,51 @@ SimulationImpl::Neighbourhood SimulationImpl::GetNeighbourhood(int i) const
 	return n;
 }
 
+// PERFIL do laco de particulas (branch prof/update-particles, nao e para merge).
+//
+// O laco chama quatro coisas por particula: GetNeighbourhood, TransitionPhase, o
+// callback elements[t].Update e MovementPhase. Sabemos que UpdateParticles e 92%
+// do trabalho de simulacao, mas nunca medimos onde DENTRO dele. Estes acumuladores
+// respondem isso, e a atribuicao por elemento responde se um tipo especifico domina.
+//
+// Por que __rdtsc e nao steady_clock por particula: com 144 mil particulas e 4 fases
+// seriam ~1,1 milhao de leituras de relogio por frame. steady_clock custa dezenas de
+// ns e afogaria o sinal; __rdtsc custa poucos ciclos. O custo residual da sonda fica
+// visivel na comparacao entre o tempo de parede medido aqui e o baseline de 25,90 ms.
+namespace
+{
+	struct UpdateProfile
+	{
+		// acumuladores do frame corrente
+		uint64_t cycTotal = 0, cycNeigh = 0, cycTrans = 0, cycUpdate = 0, cycMove = 0;
+		uint64_t particles = 0;
+		double wallUs = 0;
+		// atribuicao do callback Update por tipo de elemento, acumulada em toda a corrida
+		uint64_t elemCycles[PT_NUM] = {};
+		uint64_t elemCalls[PT_NUM] = {};
+		int frame = 0;
+		bool headerWritten = false;
+
+		void ResetFrame()
+		{
+			cycTotal = cycNeigh = cycTrans = cycUpdate = cycMove = 0;
+			particles = 0;
+			wallUs = 0;
+		}
+	};
+	UpdateProfile gProf;
+}
+
 void SimulationImpl::UpdateParticles(int start, int end)
 {
+	// PERFIL: relogio de parede da chamada inteira + contador de ciclos por fase.
+	// Os dois juntos permitem converter ciclos em ms sem depender da frequencia do
+	// TSC (que varia com boost): a fracao de ciclos de cada fase multiplica o tempo
+	// de parede medido. E comparar este tempo de parede com o baseline conhecido de
+	// 25,90 ms mostra quanto a propria sonda esta custando.
+	auto profWall0 = std::chrono::steady_clock::now();
+	auto profCyc0 = __rdtsc();
+
 	//the main particle loop function, goes over all particles.
 	auto &sd = SimulationData::CRef();
 	auto &elements = sd.elements;
@@ -2358,7 +2404,10 @@ void SimulationImpl::UpdateParticles(int start, int end)
 			}
 		}
 
+		gProf.particles++;
+		auto profNb0 = __rdtsc();
 		auto neighbourhood = GetNeighbourhood(i);
+		gProf.cycNeigh += __rdtsc() - profNb0;
 
 		//velocity updates for the particle
 		if (t != PT_SPNG || !(parts[i].flags&FLAG_MOVABLE))
@@ -2377,7 +2426,9 @@ void SimulationImpl::UpdateParticles(int start, int end)
 			parts[i].vy += elements[t].Diffusion*(2.0f*rng.uniform01()-1.0f);
 		}
 
+		auto profTr0 = __rdtsc();
 		auto transitionOccurred = TransitionPhase(i, neighbourhood);
+		gProf.cycTrans += __rdtsc() - profTr0;
 		if (!parts[i].type)
 		{
 			continue;
@@ -2390,7 +2441,15 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		//call the particle update function, if there is one
 		if (elements[t].Update)
 		{
-			if ((*(elements[t].Update))(this, i, x, y, neighbourhood.surround_space, neighbourhood.nt, parts, pmap))
+			// atribuicao por elemento: `t` e lido ANTES da chamada porque o callback
+			// pode trocar o tipo da particula, e o custo pertence a quem foi chamado
+			auto profUp0 = __rdtsc();
+			auto profUpdateRet = (*(elements[t].Update))(this, i, x, y, neighbourhood.surround_space, neighbourhood.nt, parts, pmap);
+			auto profUpDelta = __rdtsc() - profUp0;
+			gProf.cycUpdate += profUpDelta;
+			gProf.elemCycles[t] += profUpDelta;
+			gProf.elemCalls[t]++;
+			if (profUpdateRet)
 				continue;
 			x = int(parts[i].x+0.5f);
 			y = int(parts[i].y+0.5f);
@@ -2408,8 +2467,51 @@ void SimulationImpl::UpdateParticles(int start, int end)
 		if (!parts[i].vx&&!parts[i].vy)//if its not moving, skip to next particle, movement code it next
 			continue;
 
+		auto profMv0 = __rdtsc();
 		MovementPhase(i, neighbourhood);
+		gProf.cycMove += __rdtsc() - profMv0;
 	}
+
+	// Fecha o frame. "outro" = total - as quatro fases: e o custo do proprio corpo do
+	// laco (checagem de borda, parede, pressao, adveccao, difusao) mais a sonda.
+	gProf.cycTotal += __rdtsc() - profCyc0;
+	gProf.wallUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - profWall0).count();
+	gProf.frame++;
+
+	if (FILE *f = fopen("prof_frames.csv", gProf.headerWritten ? "a" : "w"))
+	{
+		if (!gProf.headerWritten)
+		{
+			fprintf(f, "frame,particulas,parede_us,cic_total,cic_vizinhanca,cic_transicao,cic_update,cic_movimento\n");
+			gProf.headerWritten = true;
+		}
+		fprintf(f, "%d,%llu,%.1f,%llu,%llu,%llu,%llu,%llu\n", gProf.frame,
+			(unsigned long long)gProf.particles, gProf.wallUs,
+			(unsigned long long)gProf.cycTotal, (unsigned long long)gProf.cycNeigh,
+			(unsigned long long)gProf.cycTrans, (unsigned long long)gProf.cycUpdate,
+			(unsigned long long)gProf.cycMove);
+		fclose(f);
+	}
+
+	// Tabela por elemento: reescrita periodicamente para sobreviver ao os.exit do Lua.
+	if (gProf.frame % 50 == 0)
+	{
+		if (FILE *f = fopen("prof_elements.csv", "w"))
+		{
+			auto &sdNames = SimulationData::CRef();
+			fprintf(f, "elemento,chamadas,ciclos\n");
+			for (int e = 1; e < PT_NUM; e++)
+			{
+				if (gProf.elemCalls[e])
+				{
+					fprintf(f, "%s,%llu,%llu\n", sdNames.elements[e].Name.ToUtf8().c_str(),
+						(unsigned long long)gProf.elemCalls[e], (unsigned long long)gProf.elemCycles[e]);
+				}
+			}
+			fclose(f);
+		}
+	}
+	gProf.ResetFrame();
 }
 
 bool SimulationImpl::TransitionPhase(int i, const Neighbourhood &neighbourhood)
