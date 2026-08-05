@@ -976,7 +976,12 @@ void Simulation::set_emap(int x, int y)
 		for (x=x1; x<=x2; x++)
 			if (is_wire_off(x, y+1))
 			{
-				if (x==x1 || x==x2 || y<0 ||
+				// y<1 (nao y<0): este termo e o espelho de y>=YCELLS-1 no ramo de
+				// cima, cuja funcao e curto-circuitar a cadeia de OR antes que os
+				// termos seguintes leiam a linha vizinha fora do mapa. Aqui os
+				// termos leem y-1, entao a guarda tem de disparar em y==0. Escrito
+				// como y<0 ela nunca dispara, e is_wire(x-1, y-1) le bmap[-1][x-1].
+				if (x==x1 || x==x2 || y<1 ||
 				        is_wire(x-1, y+1) || is_wire(x+1, y+1) ||
 				        is_wire(x-1, y-1) || !is_wire(x, y-1) || is_wire(x+1, y-1))
 					set_emap(x, y+1);
