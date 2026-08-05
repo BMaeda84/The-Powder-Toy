@@ -2320,6 +2320,7 @@ namespace
 		// tanto quanto o custo de cada bloco.
 		uint64_t tpGateSeen = 0, tpGatePassed = 0;
 		uint64_t partsConflicting = 0; // particulas que tocaram celula de outro pedaco
+		uint64_t tpIsothermal = 0;     // quantas vezes o caminho rapido isotermico pegou
 		uint64_t cycTpConv = 0;   // conveccao de calor dos liquidos (GetGravityField)
 		uint64_t cycTpHeat = 0;   // laco dos 8 vizinhos + temperatura de equilibrio
 		uint64_t cycTpChange = 0; // as transicoes de fase propriamente ditas
@@ -2336,10 +2337,25 @@ namespace
 			wallUs = 0;
 			tpGateSeen = tpGatePassed = 0;
 			partsConflicting = 0;
+			tpIsothermal = 0;
 			cycTpConv = cycTpHeat = cycTpChange = 0;
 		}
 	};
 	UpdateProfile gProf;
+
+	// Interruptor dos caminhos rapidos. Ter os dois no MESMO binario e o que torna a
+	// comparacao honesta: mesma compilacao, mesmo custo de sonda, mesma cena. Duas
+	// builds diferentes trariam variacao que eu confundiria com ganho.
+	// TPT_PROF_FASTPATH=0 desliga; ausente ou qualquer outro valor liga.
+	bool ProfFastPaths()
+	{
+		static bool v = []
+		{
+			const char *e = getenv("TPT_PROF_FASTPATH");
+			return !e || e[0] != '0';
+		}();
+		return v;
+	}
 
 	// TAXA DE CONFLITO: se dividissemos o intervalo de IDs em NUM_CHUNKS pedacos
 	// contiguos, um por thread, com que frequencia duas particulas de pedacos
@@ -2571,16 +2587,39 @@ void SimulationImpl::UpdateParticles(int start, int end)
 	gProf.wallUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - profWall0).count();
 	gProf.frame++;
 
+	// Checksum de estado: FNV-1a sobre os BITS da temperatura e o tipo de cada
+	// particula viva. Serve para responder se os caminhos rapidos mudaram o estado da
+	// simulacao -- inclusive por arredondamento de float, porque um unico bit
+	// diferente muda o checksum inteiro. Calculado a cada 100 frames para nao pesar.
+	uint64_t profChecksum = 0;
+	if (gProf.frame % 100 == 0)
+	{
+		profChecksum = 1469598103934665603ULL;
+		for (int k = 0; k < parts.active; k++)
+		{
+			if (!parts[k].type)
+				continue;
+			uint32_t bits;
+			memcpy(&bits, &parts[k].temp, sizeof(bits));
+			uint64_t v = (uint64_t(parts[k].type) << 32) | bits;
+			for (int b = 0; b < 8; b++)
+			{
+				profChecksum ^= (v >> (b * 8)) & 0xFF;
+				profChecksum *= 1099511628211ULL;
+			}
+		}
+	}
+
 	if (FILE *f = fopen("prof_frames.csv", gProf.headerWritten ? "a" : "w"))
 	{
 		if (!gProf.headerWritten)
 		{
 			fprintf(f, "frame,particulas,parede_us,cic_total,cic_vizinhanca,cic_transicao,cic_update,cic_movimento,"
 				"tp_portao_visto,tp_portao_passou,cic_tp_conveccao,cic_tp_calor,cic_tp_mudanca,"
-				"conf_particulas,conf_celulas,conf_marcas\n");
+				"conf_particulas,conf_celulas,conf_marcas,tp_isotermico,checksum\n");
 			gProf.headerWritten = true;
 		}
-		fprintf(f, "%d,%llu,%.1f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", gProf.frame,
+		fprintf(f, "%d,%llu,%.1f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", gProf.frame,
 			(unsigned long long)gProf.particles, gProf.wallUs,
 			(unsigned long long)gProf.cycTotal, (unsigned long long)gProf.cycNeigh,
 			(unsigned long long)gProf.cycTrans, (unsigned long long)gProf.cycUpdate,
@@ -2589,7 +2628,8 @@ void SimulationImpl::UpdateParticles(int start, int end)
 			(unsigned long long)gProf.cycTpConv, (unsigned long long)gProf.cycTpHeat,
 			(unsigned long long)gProf.cycTpChange,
 			(unsigned long long)gProf.partsConflicting,
-			(unsigned long long)gConflictCells, (unsigned long long)gMarks);
+			(unsigned long long)gConflictCells, (unsigned long long)gMarks,
+			(unsigned long long)gProf.tpIsothermal, (unsigned long long)profChecksum);
 		fclose(f);
 	}
 
@@ -2632,10 +2672,26 @@ bool SimulationImpl::TransitionPhase(int i, const Neighbourhood &neighbourhood)
 		auto profTpConv0 = __rdtsc();
 		if ((elements[t].Properties&TYPE_LIQUID) && (t!=PT_GEL || gel_scale > (1 + rng.between(0, 254))))
 		{
-			float convGravX, convGravY;
-			GetGravityField(x, y, -2.0f, -2.0f, convGravX, convGravY);
-			auto offsetX = std::clamp(int(std::round(convGravX + x)), x-1, x+1);
-			auto offsetY = std::clamp(int(std::round(convGravY + y)), y-1, y+1);
+			// CAMINHO RAPIDO 1: com gravidade vertical padrao e sem gravidade
+			// newtoniana, GetGravityField devolve sempre (0, particleGrav) = (0, -2),
+			// e gravOut esta zerado por invariante quando `grav` esta vazio. Entao:
+			//   offsetX = clamp(round(0 + x), x-1, x+1) = x
+			//   offsetY = clamp(round(-2 + y), y-1, y+1) = y-1   (pois y-2 < y-1)
+			// O resultado e identico bit a bit; o que se evita e a chamada, o round e
+			// os dois clamps, por liquido, por frame.
+			int offsetX, offsetY;
+			if (ProfFastPaths() && gravityMode == GRAV_VERTICAL && !grav)
+			{
+				offsetX = x;
+				offsetY = y - 1;
+			}
+			else
+			{
+				float convGravX, convGravY;
+				GetGravityField(x, y, -2.0f, -2.0f, convGravX, convGravY);
+				offsetX = std::clamp(int(std::round(convGravX + x)), x-1, x+1);
+				offsetY = std::clamp(int(std::round(convGravY + y)), y-1, y+1);
+			}
 			// Some heat convection for liquids
 			if (offsetX != x || offsetY != y)
 			{
@@ -2673,48 +2729,84 @@ bool SimulationImpl::TransitionPhase(int i, const Neighbourhood &neighbourhood)
 
 			// Heat transfer with other elements
 			auto profTpHeat0 = __rdtsc();
-			auto hc_total = 0.0f; // Total heat capacity of elements involved
-			auto c_heat = 0.0f; // Total heat distributed between elements
-			int surround_hconduct[8]; // IDs of elements which exchange heat
-
-			for (auto j=0; j<8; j++)
+			// CAMINHO RAPIDO 2: se todos os vizinhos ocupados estiverem exatamente na
+			// mesma temperatura desta particula, a temperatura de equilibrio e essa
+			// mesma temperatura, e as nove escritas abaixo sao no-ops.
+			//
+			// Repare que nesse caso nem importa QUAIS vizinhos conduzem calor: a media
+			// ponderada de valores todos iguais a T e T para qualquer subconjunto e
+			// quaisquer pesos. Por isso da para decidir so comparando as 8 temperaturas,
+			// pulando os testes de elegibilidade, ate 9 chamadas a HeatCapacityOf, as
+			// somas e as 9 escritas.
+			//
+			// Ressalva honesta: identico na matematica, nao garantidamente bit a bit.
+			// Sum(T*hc_j) / Sum(hc_j) pode diferir de T por arredondamento de float.
+			// Por isso o checksum de temperatura abaixo, para medir se diverge.
+			bool profIsothermal = ProfFastPaths();
+			if (profIsothermal)
 			{
-				surround_hconduct[j] = i;
-				auto r = neighbourhood.surround[j];
-
-				if (!r)
-					continue;
-
-				auto rt = TYP(r);
-
-				// Check if we can conduct heat
-				if (!rt || sd.IsHeatInsulator(parts[ID(r)])
-				        || (t == PT_FILT && (rt == PT_BRAY || rt == PT_BIZR || rt == PT_BIZRG))
-				        || (rt == PT_FILT && (t == PT_BRAY || t == PT_PHOT || t == PT_BIZR || t == PT_BIZRG))
-				        || (t == PT_ELEC && rt == PT_DEUT)
-				        || (t == PT_DEUT && rt == PT_ELEC)
-				        || (t == PT_HSWC && rt == PT_FILT && parts[i].tmp == 1)
-				        || (t == PT_FILT && rt == PT_HSWC && parts[ID(r)].tmp == 1))
-					continue;
-
-				surround_hconduct[j] = ID(r);
-				auto hc = sd.HeatCapacityOf(parts[ID(r)]);
-				c_heat += parts[ID(r)].temp*hc;
-				hc_total += hc;
+				for (auto j=0; j<8; j++)
+				{
+					auto r = neighbourhood.surround[j];
+					if (r && parts[ID(r)].temp != parts[i].temp)
+					{
+						profIsothermal = false;
+						break;
+					}
+				}
 			}
 
-			// Add the current particle
-			auto hc = sd.HeatCapacityOf(parts[i]);
-			c_heat += parts[i].temp*hc;
-			hc_total += hc;
-
-			// Equilibrium temperature
-			float pt = restrict_flt(c_heat / hc_total, MIN_TEMP, MAX_TEMP);
-
-			parts[i].temp = pt;
-			for (auto j=0; j<8; j++)
+			float pt;
+			if (profIsothermal)
 			{
-				parts[surround_hconduct[j]].temp = pt;
+				gProf.tpIsothermal++;
+				pt = parts[i].temp;
+			}
+			else
+			{
+				auto hc_total = 0.0f; // Total heat capacity of elements involved
+				auto c_heat = 0.0f; // Total heat distributed between elements
+				int surround_hconduct[8]; // IDs of elements which exchange heat
+
+				for (auto j=0; j<8; j++)
+				{
+					surround_hconduct[j] = i;
+					auto r = neighbourhood.surround[j];
+
+					if (!r)
+						continue;
+
+					auto rt = TYP(r);
+
+					// Check if we can conduct heat
+					if (!rt || sd.IsHeatInsulator(parts[ID(r)])
+					        || (t == PT_FILT && (rt == PT_BRAY || rt == PT_BIZR || rt == PT_BIZRG))
+					        || (rt == PT_FILT && (t == PT_BRAY || t == PT_PHOT || t == PT_BIZR || t == PT_BIZRG))
+					        || (t == PT_ELEC && rt == PT_DEUT)
+					        || (t == PT_DEUT && rt == PT_ELEC)
+					        || (t == PT_HSWC && rt == PT_FILT && parts[i].tmp == 1)
+					        || (t == PT_FILT && rt == PT_HSWC && parts[ID(r)].tmp == 1))
+						continue;
+
+					surround_hconduct[j] = ID(r);
+					auto hc = sd.HeatCapacityOf(parts[ID(r)]);
+					c_heat += parts[ID(r)].temp*hc;
+					hc_total += hc;
+				}
+
+				// Add the current particle
+				auto hc = sd.HeatCapacityOf(parts[i]);
+				c_heat += parts[i].temp*hc;
+				hc_total += hc;
+
+				// Equilibrium temperature
+				pt = restrict_flt(c_heat / hc_total, MIN_TEMP, MAX_TEMP);
+
+				parts[i].temp = pt;
+				for (auto j=0; j<8; j++)
+				{
+					parts[surround_hconduct[j]].temp = pt;
+				}
 			}
 
 			gProf.cycTpHeat += __rdtsc() - profTpHeat0;

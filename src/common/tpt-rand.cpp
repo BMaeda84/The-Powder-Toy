@@ -57,6 +57,16 @@ double RNG::uniform01Double()
 
 RNG::RNG()
 {
+	// PERFIL: o TPT semeia com time(nullptr), entao duas execucoes da MESMA cena
+	// evoluem diferente. Sem semente fixa nao da para comparar estado entre duas
+	// configuracoes -- qualquer diferenca poderia ser so o relogio. TPT_RNG_SEED
+	// torna a corrida reproduzivel; sem a variavel, comportamento original.
+	if (const char *e = getenv("TPT_RNG_SEED"))
+	{
+		s[0] = strtoull(e, nullptr, 10);
+		s[1] = 614;
+		return;
+	}
 	s[0] = time(nullptr);
 	s[1] = 614;
 }
